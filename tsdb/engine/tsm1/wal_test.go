@@ -6,12 +6,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
-
 	"github.com/golang/snappy"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
 
-func TestWALWriter_WritePoints_Single(t *testing.T) {
+func TestWALWriter_WriteMulti_Single(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
 	f := MustTempFile(dir)
@@ -21,12 +20,14 @@ func TestWALWriter_WritePoints_Single(t *testing.T) {
 	p2 := tsm1.NewValue(1, int64(1))
 	p3 := tsm1.NewValue(1, true)
 	p4 := tsm1.NewValue(1, "string")
+	p5 := tsm1.NewValue(1, ^uint64(0))
 
 	values := map[string][]tsm1.Value{
-		"cpu,host=A#!~#float":  []tsm1.Value{p1},
-		"cpu,host=A#!~#int":    []tsm1.Value{p2},
-		"cpu,host=A#!~#bool":   []tsm1.Value{p3},
-		"cpu,host=A#!~#string": []tsm1.Value{p4},
+		"cpu,host=A#!~#float":    []tsm1.Value{p1},
+		"cpu,host=A#!~#int":      []tsm1.Value{p2},
+		"cpu,host=A#!~#bool":     []tsm1.Value{p3},
+		"cpu,host=A#!~#string":   []tsm1.Value{p4},
+		"cpu,host=A#!~#unsigned": []tsm1.Value{p5},
 	}
 
 	entry := &tsm1.WriteWALEntry{
@@ -35,6 +36,10 @@ func TestWALWriter_WritePoints_Single(t *testing.T) {
 
 	if err := w.Write(mustMarshalEntry(entry)); err != nil {
 		fatal(t, "write points", err)
+	}
+
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
 	}
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -70,7 +75,7 @@ func TestWALWriter_WritePoints_Single(t *testing.T) {
 	}
 }
 
-func TestWALWriter_WritePoints_LargeBatch(t *testing.T) {
+func TestWALWriter_WriteMulti_LargeBatch(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
 	f := MustTempFile(dir)
@@ -94,6 +99,10 @@ func TestWALWriter_WritePoints_LargeBatch(t *testing.T) {
 		fatal(t, "write points", err)
 	}
 
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
+	}
+
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		fatal(t, "seek", err)
 	}
@@ -126,7 +135,7 @@ func TestWALWriter_WritePoints_LargeBatch(t *testing.T) {
 		t.Fatalf("wrong count of bytes read, got %d, exp %d", n, MustReadFileSize(f))
 	}
 }
-func TestWALWriter_WritePoints_Multiple(t *testing.T) {
+func TestWALWriter_WriteMulti_Multiple(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
 	f := MustTempFile(dir)
@@ -150,6 +159,9 @@ func TestWALWriter_WritePoints_Multiple(t *testing.T) {
 
 		if err := w.Write(mustMarshalEntry(entry)); err != nil {
 			fatal(t, "write points", err)
+		}
+		if err := w.Flush(); err != nil {
+			fatal(t, "flush", err)
 		}
 	}
 
@@ -204,11 +216,15 @@ func TestWALWriter_WriteDelete_Single(t *testing.T) {
 	w := tsm1.NewWALSegmentWriter(f)
 
 	entry := &tsm1.DeleteWALEntry{
-		Keys: []string{"cpu"},
+		Keys: [][]byte{[]byte("cpu")},
 	}
 
 	if err := w.Write(mustMarshalEntry(entry)); err != nil {
 		fatal(t, "write points", err)
+	}
+
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
 	}
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -235,12 +251,12 @@ func TestWALWriter_WriteDelete_Single(t *testing.T) {
 		t.Fatalf("key length mismatch: got %v, exp %v", got, exp)
 	}
 
-	if got, exp := e.Keys[0], entry.Keys[0]; got != exp {
+	if got, exp := string(e.Keys[0]), string(entry.Keys[0]); got != exp {
 		t.Fatalf("key mismatch: got %v, exp %v", got, exp)
 	}
 }
 
-func TestWALWriter_WritePointsDelete_Multiple(t *testing.T) {
+func TestWALWriter_WriteMultiDelete_Multiple(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
 	f := MustTempFile(dir)
@@ -259,13 +275,21 @@ func TestWALWriter_WritePointsDelete_Multiple(t *testing.T) {
 		fatal(t, "write points", err)
 	}
 
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
+	}
+
 	// Write the delete entry
 	deleteEntry := &tsm1.DeleteWALEntry{
-		Keys: []string{"cpu,host=A#!~value"},
+		Keys: [][]byte{[]byte("cpu,host=A#!~value")},
 	}
 
 	if err := w.Write(mustMarshalEntry(deleteEntry)); err != nil {
 		fatal(t, "write points", err)
+	}
+
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
 	}
 
 	// Seek back to the beinning of the file for reading
@@ -321,12 +345,12 @@ func TestWALWriter_WritePointsDelete_Multiple(t *testing.T) {
 		t.Fatalf("key length mismatch: got %v, exp %v", got, exp)
 	}
 
-	if got, exp := de.Keys[0], deleteEntry.Keys[0]; got != exp {
+	if got, exp := string(de.Keys[0]), string(deleteEntry.Keys[0]); got != exp {
 		t.Fatalf("key mismatch: got %v, exp %v", got, exp)
 	}
 }
 
-func TestWALWriter_WritePointsDeleteRange_Multiple(t *testing.T) {
+func TestWALWriter_WriteMultiDeleteRange_Multiple(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
 	f := MustTempFile(dir)
@@ -348,15 +372,23 @@ func TestWALWriter_WritePointsDeleteRange_Multiple(t *testing.T) {
 		fatal(t, "write points", err)
 	}
 
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
+	}
+
 	// Write the delete entry
 	deleteEntry := &tsm1.DeleteRangeWALEntry{
-		Keys: []string{"cpu,host=A#!~value"},
+		Keys: [][]byte{[]byte("cpu,host=A#!~value")},
 		Min:  2,
 		Max:  3,
 	}
 
 	if err := w.Write(mustMarshalEntry(deleteEntry)); err != nil {
 		fatal(t, "write points", err)
+	}
+
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
 	}
 
 	// Seek back to the beinning of the file for reading
@@ -412,7 +444,7 @@ func TestWALWriter_WritePointsDeleteRange_Multiple(t *testing.T) {
 		t.Fatalf("key length mismatch: got %v, exp %v", got, exp)
 	}
 
-	if got, exp := de.Keys[0], deleteEntry.Keys[0]; got != exp {
+	if got, exp := string(de.Keys[0]), string(deleteEntry.Keys[0]); got != exp {
 		t.Fatalf("key mismatch: got %v, exp %v", got, exp)
 	}
 
@@ -444,7 +476,7 @@ func TestWAL_ClosedSegments(t *testing.T) {
 		t.Fatalf("close segment length mismatch: got %v, exp %v", got, exp)
 	}
 
-	if _, err := w.WritePoints(map[string][]tsm1.Value{
+	if _, err := w.WriteMulti(map[string][]tsm1.Value{
 		"cpu,host=A#!~#value": []tsm1.Value{
 			tsm1.NewValue(1, 1.1),
 		},
@@ -490,7 +522,7 @@ func TestWAL_Delete(t *testing.T) {
 		t.Fatalf("close segment length mismatch: got %v, exp %v", got, exp)
 	}
 
-	if _, err := w.Delete([]string{"cpu"}); err != nil {
+	if _, err := w.Delete([][]byte{[]byte("cpu")}); err != nil {
 		t.Fatalf("error writing points: %v", err)
 	}
 
@@ -533,6 +565,10 @@ func TestWALWriter_Corrupt(t *testing.T) {
 		fatal(t, "write points", err)
 	}
 
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
+	}
+
 	// Write some random bytes to the file to simulate corruption.
 	if _, err := f.Write(corruption); err != nil {
 		fatal(t, "corrupt WAL segment", err)
@@ -567,17 +603,65 @@ func TestWALWriter_Corrupt(t *testing.T) {
 	}
 }
 
+// Reproduces a `panic: runtime error: makeslice: cap out of range` when run with
+// GOARCH=386 go test -run TestWALSegmentReader_Corrupt -v ./tsdb/engine/tsm1/
+func TestWALSegmentReader_Corrupt(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+	f := MustTempFile(dir)
+	w := tsm1.NewWALSegmentWriter(f)
+
+	p4 := tsm1.NewValue(1, "string")
+
+	values := map[string][]tsm1.Value{
+		"cpu,host=A#!~#string": []tsm1.Value{p4, p4},
+	}
+
+	entry := &tsm1.WriteWALEntry{
+		Values: values,
+	}
+
+	typ, b := mustMarshalEntry(entry)
+
+	// This causes the nvals field to overflow on 32 bit systems which produces a
+	// negative count and a panic when reading the segment.
+	b[25] = 255
+
+	if err := w.Write(typ, b); err != nil {
+		fatal(t, "write points", err)
+	}
+
+	if err := w.Flush(); err != nil {
+		fatal(t, "flush", err)
+	}
+
+	// Create the WAL segment reader.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		fatal(t, "seek", err)
+	}
+
+	r := tsm1.NewWALSegmentReader(f)
+	defer r.Close()
+
+	// Try to decode two entries.
+	for r.Next() {
+		r.Read()
+	}
+}
+
 func TestWriteWALSegment_UnmarshalBinary_WriteWALCorrupt(t *testing.T) {
 	p1 := tsm1.NewValue(1, 1.1)
 	p2 := tsm1.NewValue(1, int64(1))
 	p3 := tsm1.NewValue(1, true)
 	p4 := tsm1.NewValue(1, "string")
+	p5 := tsm1.NewValue(1, uint64(1))
 
 	values := map[string][]tsm1.Value{
-		"cpu,host=A#!~#float":  []tsm1.Value{p1, p1},
-		"cpu,host=A#!~#int":    []tsm1.Value{p2, p2},
-		"cpu,host=A#!~#bool":   []tsm1.Value{p3, p3},
-		"cpu,host=A#!~#string": []tsm1.Value{p4, p4},
+		"cpu,host=A#!~#float":    []tsm1.Value{p1, p1},
+		"cpu,host=A#!~#int":      []tsm1.Value{p2, p2},
+		"cpu,host=A#!~#bool":     []tsm1.Value{p3, p3},
+		"cpu,host=A#!~#string":   []tsm1.Value{p4, p4},
+		"cpu,host=A#!~#unsigned": []tsm1.Value{p5, p5},
 	}
 
 	w := &tsm1.WriteWALEntry{
@@ -603,7 +687,7 @@ func TestWriteWALSegment_UnmarshalBinary_WriteWALCorrupt(t *testing.T) {
 
 func TestWriteWALSegment_UnmarshalBinary_DeleteWALCorrupt(t *testing.T) {
 	w := &tsm1.DeleteWALEntry{
-		Keys: []string{"foo", "bar"},
+		Keys: [][]byte{[]byte("foo"), []byte("bar")},
 	}
 
 	b, err := w.MarshalBinary()
@@ -625,7 +709,7 @@ func TestWriteWALSegment_UnmarshalBinary_DeleteWALCorrupt(t *testing.T) {
 
 func TestWriteWALSegment_UnmarshalBinary_DeleteRangeWALCorrupt(t *testing.T) {
 	w := &tsm1.DeleteRangeWALEntry{
-		Keys: []string{"foo", "bar"},
+		Keys: [][]byte{[]byte("foo"), []byte("bar")},
 		Min:  1,
 		Max:  2,
 	}

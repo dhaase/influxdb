@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/dgryski/go-bits"
 	"github.com/dgryski/go-bitstream"
+	"github.com/influxdata/influxdb/pkg/bits"
 )
 
 const (
@@ -78,18 +78,18 @@ func (s *FloatEncoder) Bytes() ([]byte, error) {
 	return s.buf.Bytes(), s.err
 }
 
-// Finish indicates there are no more values to encode.
-func (s *FloatEncoder) Finish() {
+// Flush indicates there are no more values to encode.
+func (s *FloatEncoder) Flush() {
 	if !s.finished {
 		// write an end-of-stream record
 		s.finished = true
-		s.Push(math.NaN())
+		s.Write(math.NaN())
 		s.bw.Flush(bitstream.Zero)
 	}
 }
 
-// Push encodes v to the underlying buffer.
-func (s *FloatEncoder) Push(v float64) {
+// Write encodes v to the underlying buffer.
+func (s *FloatEncoder) Write(v float64) {
 	// Only allow NaN as a sentinel value
 	if math.IsNaN(v) && !s.finished {
 		s.err = fmt.Errorf("unsupported value: NaN")
@@ -110,8 +110,8 @@ func (s *FloatEncoder) Push(v float64) {
 	} else {
 		s.bw.WriteBit(bitstream.One)
 
-		leading := bits.Clz(vDelta)
-		trailing := bits.Ctz(vDelta)
+		leading := uint64(bits.LeadingZeros64(vDelta))
+		trailing := uint64(bits.TrailingZeros64(vDelta))
 
 		// Clamp number of leading zeros to avoid overflow when encoding
 		leading &= 0x1F

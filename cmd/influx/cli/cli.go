@@ -3,6 +3,7 @@ package cli // import "github.com/influxdata/influxdb/cmd/influx/cli"
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,8 +25,8 @@ import (
 
 	"github.com/influxdata/influxdb/client"
 	"github.com/influxdata/influxdb/importer/v8"
-	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxql"
 	"github.com/peterh/liner"
 )
 
@@ -47,6 +49,7 @@ type CommandLine struct {
 	ShowVersion     bool
 	Import          bool
 	Chunked         bool
+	ChunkSize       int
 	Quit            chan struct{}
 	IgnoreSignals   bool // Ignore signals normally caught by this process (used primarily for testing)
 	ForceTTY        bool // Force the CLI to act as if it were connected to a TTY
@@ -64,6 +67,7 @@ func New(version string) *CommandLine {
 		ClientVersion: version,
 		Quit:          make(chan struct{}, 1),
 		osSignals:     make(chan os.Signal, 1),
+		Chunked:       true,
 	}
 }
 
@@ -221,6 +225,7 @@ func (c *CommandLine) mainLoop() error {
 				return e
 			}
 			if err := c.ParseCommand(l); err != ErrBlankCommand && !strings.HasPrefix(strings.TrimSpace(l), "auth") {
+				l = influxql.Sanitize(l)
 				c.Line.AppendHistory(l)
 				c.saveHistory()
 			}
@@ -256,6 +261,15 @@ func (c *CommandLine) ParseCommand(cmd string) error {
 			c.SetWriteConsistency(cmd)
 		case "settings":
 			c.Settings()
+		case "chunked":
+			c.Chunked = !c.Chunked
+			if c.Chunked {
+				fmt.Println("chunked responses enabled")
+			} else {
+				fmt.Println("chunked reponses disabled")
+			}
+		case "chunk":
+			c.SetChunkSize(cmd)
 		case "pretty":
 			c.Pretty = !c.Pretty
 			if c.Pretty {
@@ -280,6 +294,9 @@ func (c *CommandLine) ParseCommand(cmd string) error {
 
 // Connect connects to a server.
 func (c *CommandLine) Connect(cmd string) error {
+	// normalize cmd
+	cmd = strings.ToLower(cmd)
+
 	// Remove the "connect" keyword if it exists
 	addr := strings.TrimSpace(strings.Replace(cmd, "connect", "", -1))
 	if addr == "" {
@@ -490,6 +507,31 @@ func (c *CommandLine) retentionPolicyExists(db, rp string) bool {
 	return true
 }
 
+// SetChunkSize sets the chunk size
+// 0 sets it back to the default
+func (c *CommandLine) SetChunkSize(cmd string) {
+	// normalize cmd
+	cmd = strings.ToLower(cmd)
+	cmd = strings.Join(strings.Fields(cmd), " ")
+
+	// Remove the "chunk size" keyword if it exists
+	cmd = strings.TrimPrefix(cmd, "chunk size ")
+
+	// Remove the "chunk" keyword if it exists
+	// allows them to use `chunk 50` as a shortcut
+	cmd = strings.TrimPrefix(cmd, "chunk ")
+
+	if n, err := strconv.ParseInt(cmd, 10, 64); err == nil {
+		c.ChunkSize = int(n)
+		if c.ChunkSize <= 0 {
+			c.ChunkSize = 0
+		}
+		fmt.Printf("chunk size set to %d\n", c.ChunkSize)
+	} else {
+		fmt.Printf("unable to parse chunk size from %q\n", cmd)
+	}
+}
+
 // SetPrecision sets client precision.
 func (c *CommandLine) SetPrecision(cmd string) {
 	// normalize cmd
@@ -512,10 +554,10 @@ func (c *CommandLine) SetPrecision(cmd string) {
 
 // SetFormat sets output format.
 func (c *CommandLine) SetFormat(cmd string) {
-	// Remove the "format" keyword if it exists
-	cmd = strings.TrimSpace(strings.Replace(cmd, "format", "", -1))
 	// normalize cmd
 	cmd = strings.ToLower(cmd)
+	// Remove the "format" keyword if it exists
+	cmd = strings.TrimSpace(strings.Replace(cmd, "format", "", -1))
 
 	switch cmd {
 	case "json", "csv", "column":
@@ -527,10 +569,10 @@ func (c *CommandLine) SetFormat(cmd string) {
 
 // SetWriteConsistency sets write consistency level.
 func (c *CommandLine) SetWriteConsistency(cmd string) {
-	// Remove the "consistency" keyword if it exists
-	cmd = strings.TrimSpace(strings.Replace(cmd, "consistency", "", -1))
 	// normalize cmd
 	cmd = strings.ToLower(cmd)
+	// Remove the "consistency" keyword if it exists
+	cmd = strings.TrimSpace(strings.Replace(cmd, "consistency", "", -1))
 
 	_, err := models.ParseConsistencyLevel(cmd)
 	if err != nil {
@@ -659,9 +701,10 @@ func (c *CommandLine) Insert(stmt string) error {
 // query creates a query struct to be used with the client.
 func (c *CommandLine) query(query string) client.Query {
 	return client.Query{
-		Command:  query,
-		Database: c.Database,
-		Chunked:  true,
+		Command:   query,
+		Database:  c.Database,
+		Chunked:   c.Chunked,
+		ChunkSize: c.ChunkSize,
 	}
 }
 
@@ -690,8 +733,31 @@ func (c *CommandLine) ExecuteQuery(query string) error {
 		}
 		query = pq.String()
 	}
-	response, err := c.Client.Query(c.query(query))
+
+	ctx := context.Background()
+	if !c.IgnoreSignals {
+		done := make(chan struct{})
+		defer close(done)
+
+		var cancel func()
+		ctx, cancel = context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-done:
+			case <-c.osSignals:
+				cancel()
+			}
+		}()
+	}
+
+	response, err := c.Client.QueryContext(ctx, c.query(query))
 	if err != nil {
+		if err.Error() == "" {
+			err = ctx.Err()
+			if err == context.Canceled {
+				err = errors.New("aborted by user")
+			}
+		}
 		fmt.Printf("ERR: %s\n", err)
 		return err
 	}
@@ -736,16 +802,41 @@ func (c *CommandLine) writeJSON(response *client.Response, w io.Writer) {
 	fmt.Fprintln(w, string(data))
 }
 
+func tagsEqual(prev, current map[string]string) bool {
+	return reflect.DeepEqual(prev, current)
+}
+
+func columnsEqual(prev, current []string) bool {
+	return reflect.DeepEqual(prev, current)
+}
+
+func headersEqual(prev, current models.Row) bool {
+	if prev.Name != current.Name {
+		return false
+	}
+	return tagsEqual(prev.Tags, current.Tags) && columnsEqual(prev.Columns, current.Columns)
+}
+
 func (c *CommandLine) writeCSV(response *client.Response, w io.Writer) {
 	csvw := csv.NewWriter(w)
+	var previousHeaders models.Row
 	for _, result := range response.Results {
+		suppressHeaders := len(result.Series) > 0 && headersEqual(previousHeaders, result.Series[0])
+		if !suppressHeaders && len(result.Series) > 0 {
+			previousHeaders = models.Row{
+				Name:    result.Series[0].Name,
+				Tags:    result.Series[0].Tags,
+				Columns: result.Series[0].Columns,
+			}
+		}
+
 		// Create a tabbed writer for each result as they won't always line up
-		rows := c.formatResults(result, "\t")
+		rows := c.formatResults(result, "\t", suppressHeaders)
 		for _, r := range rows {
 			csvw.Write(strings.Split(r, "\t"))
 		}
-		csvw.Flush()
 	}
+	csvw.Flush()
 }
 
 func (c *CommandLine) writeColumns(response *client.Response, w io.Writer) {
@@ -753,21 +844,40 @@ func (c *CommandLine) writeColumns(response *client.Response, w io.Writer) {
 	writer := new(tabwriter.Writer)
 	writer.Init(w, 0, 8, 1, ' ', 0)
 
-	for _, result := range response.Results {
+	var previousHeaders models.Row
+	for i, result := range response.Results {
 		// Print out all messages first
 		for _, m := range result.Messages {
 			fmt.Fprintf(w, "%s: %s.\n", m.Level, m.Text)
 		}
-		csv := c.formatResults(result, "\t")
-		for _, r := range csv {
+		// Check to see if the headers are the same as the previous row.  If so, suppress them in the output
+		suppressHeaders := len(result.Series) > 0 && headersEqual(previousHeaders, result.Series[0])
+		if !suppressHeaders && len(result.Series) > 0 {
+			previousHeaders = models.Row{
+				Name:    result.Series[0].Name,
+				Tags:    result.Series[0].Tags,
+				Columns: result.Series[0].Columns,
+			}
+		}
+
+		// If we are suppressing headers, don't output the extra line return. If we
+		// aren't suppressing headers, then we put out line returns between results
+		// (not before the first result, and not after the last result).
+		if !suppressHeaders && i > 0 {
+			fmt.Fprintln(writer, "")
+		}
+
+		rows := c.formatResults(result, "\t", suppressHeaders)
+		for _, r := range rows {
 			fmt.Fprintln(writer, r)
 		}
-		writer.Flush()
+
 	}
+	writer.Flush()
 }
 
 // formatResults will behave differently if you are formatting for columns or csv
-func (c *CommandLine) formatResults(result client.Result, separator string) []string {
+func (c *CommandLine) formatResults(result client.Result, separator string, suppressHeaders bool) []string {
 	rows := []string{}
 	// Create a tabbed writer for each result as they won't always line up
 	for i, row := range result.Series {
@@ -794,12 +904,12 @@ func (c *CommandLine) formatResults(result client.Result, separator string) []st
 		columnNames = append(columnNames, row.Columns...)
 
 		// Output a line separator if we have more than one set or results and format is column
-		if i > 0 && c.Format == "column" {
+		if i > 0 && c.Format == "column" && !suppressHeaders {
 			rows = append(rows, "")
 		}
 
 		// If we are column format, we break out the name/tag to separate lines
-		if c.Format == "column" {
+		if c.Format == "column" && !suppressHeaders {
 			if row.Name != "" {
 				n := fmt.Sprintf("name: %s", row.Name)
 				rows = append(rows, n)
@@ -810,10 +920,12 @@ func (c *CommandLine) formatResults(result client.Result, separator string) []st
 			}
 		}
 
-		rows = append(rows, strings.Join(columnNames, separator))
+		if !suppressHeaders {
+			rows = append(rows, strings.Join(columnNames, separator))
+		}
 
 		// if format is column, write dashes under each column
-		if c.Format == "column" {
+		if c.Format == "column" && !suppressHeaders {
 			lines := []string{}
 			for _, columnName := range columnNames {
 				lines = append(lines, strings.Repeat("-", len(columnName)))
@@ -836,10 +948,6 @@ func (c *CommandLine) formatResults(result client.Result, separator string) []st
 				values = append(values, interfaceToString(vv))
 			}
 			rows = append(rows, strings.Join(values, separator))
-		}
-		// Output a line separator if in column format
-		if c.Format == "column" {
-			rows = append(rows, "")
 		}
 	}
 	return rows
@@ -877,6 +985,8 @@ func (c *CommandLine) Settings() {
 	fmt.Fprintf(w, "Pretty\t%v\n", c.Pretty)
 	fmt.Fprintf(w, "Format\t%s\n", c.Format)
 	fmt.Fprintf(w, "Write Consistency\t%s\n", c.ClientConfig.WriteConsistency)
+	fmt.Fprintf(w, "Chunked\t%v\n", c.Chunked)
+	fmt.Fprintf(w, "Chunk Size\t%d\n", c.ChunkSize)
 	fmt.Fprintln(w)
 	w.Flush()
 }
@@ -886,6 +996,8 @@ func (c *CommandLine) help() {
         connect <host:port>   connects to another node specified by host:port
         auth                  prompts for username and password
         pretty                toggles pretty print for the json format
+        chunked               turns on chunked responses from server
+        chunk size <size>     sets the size of the chunked responses.  Set to 0 to reset to the default chunked size
         use <db_name>         sets current database
         format <format>       specifies the format of the server responses: json, csv, or column
         precision <format>    specifies the format of the timestamp: rfc3339, h, m, s, ms, u or ns

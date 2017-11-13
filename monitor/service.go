@@ -16,7 +16,7 @@ import (
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor/diagnostics"
 	"github.com/influxdata/influxdb/services/meta"
-	"github.com/uber-go/zap"
+	"go.uber.org/zap"
 )
 
 // Policy constants.
@@ -61,7 +61,7 @@ type Monitor struct {
 	// Writer for pushing stats back into the database.
 	PointsWriter PointsWriter
 
-	Logger zap.Logger
+	Logger *zap.Logger
 }
 
 // PointsWriter is a simplified interface for writing the points the monitor gathers.
@@ -79,7 +79,7 @@ func New(r Reporter, c Config) *Monitor {
 		storeDatabase:        c.StoreDatabase,
 		storeInterval:        time.Duration(c.StoreInterval),
 		storeRetentionPolicy: MonitorRetentionPolicy,
-		Logger:               zap.New(zap.NullEncoder()),
+		Logger:               zap.NewNop(),
 	}
 }
 
@@ -117,11 +117,40 @@ func (m *Monitor) Open() error {
 
 	// If enabled, record stats in a InfluxDB system.
 	if m.storeEnabled {
+		hostname, _ := os.Hostname()
+		m.SetGlobalTag("hostname", hostname)
+
 		// Start periodic writes to system.
 		m.wg.Add(1)
 		go m.storeStatistics()
 	}
 
+	return nil
+}
+
+func (m *Monitor) Enabled() bool { return m.storeEnabled }
+
+func (m *Monitor) WritePoints(p models.Points) error {
+	if !m.storeEnabled {
+		return nil
+	}
+
+	if len(m.globalTags) > 0 {
+		for _, pp := range p {
+			pp.SetTags(pp.Tags().Merge(m.globalTags))
+		}
+	}
+
+	return m.writePoints(p)
+}
+
+func (m *Monitor) writePoints(p models.Points) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if err := m.PointsWriter.WritePoints(m.storeDatabase, m.storeRetentionPolicy, p); err != nil {
+		m.Logger.Info(fmt.Sprintf("failed to store statistics: %s", err))
+	}
 	return nil
 }
 
@@ -182,7 +211,7 @@ func (m *Monitor) SetPointsWriter(pw PointsWriter) error {
 }
 
 // WithLogger sets the logger for the Monitor.
-func (m *Monitor) WithLogger(log zap.Logger) {
+func (m *Monitor) WithLogger(log *zap.Logger) {
 	m.Logger = log.With(zap.String("service", "monitor"))
 }
 
@@ -386,9 +415,6 @@ func (m *Monitor) storeStatistics() {
 	m.Logger.Info(fmt.Sprintf("Storing statistics in database '%s' retention policy '%s', at interval %s",
 		m.storeDatabase, m.storeRetentionPolicy, m.storeInterval))
 
-	hostname, _ := os.Hostname()
-	m.SetGlobalTag("hostname", hostname)
-
 	// Wait until an even interval to start recording monitor statistics.
 	// If we are interrupted before the interval for some reason, exit early.
 	if err := m.waitUntilInterval(m.storeInterval); err != nil {
@@ -414,24 +440,26 @@ func (m *Monitor) storeStatistics() {
 				return
 			}
 
-			points := make(models.Points, 0, len(stats))
+			// Write all stats in batches
+			batch := make(models.Points, 0, 5000)
 			for _, s := range stats {
 				pt, err := models.NewPoint(s.Name, models.NewTags(s.Tags), s.Values, now)
 				if err != nil {
 					m.Logger.Info(fmt.Sprintf("Dropping point %v: %v", s.Name, err))
 					return
 				}
-				points = append(points, pt)
+				batch = append(batch, pt)
+				if len(batch) == cap(batch) {
+					m.writePoints(batch)
+					batch = batch[:0]
+
+				}
 			}
 
-			func() {
-				m.mu.RLock()
-				defer m.mu.RUnlock()
-
-				if err := m.PointsWriter.WritePoints(m.storeDatabase, m.storeRetentionPolicy, points); err != nil {
-					m.Logger.Info(fmt.Sprintf("failed to store statistics: %s", err))
-				}
-			}()
+			// Write the last batch
+			if len(batch) > 0 {
+				m.writePoints(batch)
+			}
 		case <-m.done:
 			m.Logger.Info(fmt.Sprintf("terminating storage of statistics"))
 			return
@@ -467,22 +495,3 @@ func (a Statistics) Less(i, j int) bool {
 
 // Swap implements sort.Interface.
 func (a Statistics) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-
-// DiagnosticsFromMap returns a Diagnostics from a map.
-func DiagnosticsFromMap(m map[string]interface{}) *diagnostics.Diagnostics {
-	// Display columns in deterministic order.
-	sortedKeys := make([]string, 0, len(m))
-	for k := range m {
-		sortedKeys = append(sortedKeys, k)
-	}
-	sort.Strings(sortedKeys)
-
-	d := diagnostics.NewDiagnostics(sortedKeys)
-	row := make([]interface{}, len(sortedKeys))
-	for i, k := range sortedKeys {
-		row[i] = m[k]
-	}
-	d.AddRow(row)
-
-	return d
-}

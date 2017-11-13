@@ -1,5 +1,7 @@
 package httpd
 
+import "github.com/influxdata/influxdb/monitor/diagnostics"
+
 const (
 	// DefaultBindAddress is the default address to bind to.
 	DefaultBindAddress = ":8086"
@@ -9,6 +11,9 @@ const (
 
 	// DefaultBindSocket is the default unix socket to bind to.
 	DefaultBindSocket = "/var/run/influxdb.sock"
+
+	// DefaultMaxBodySize is the default maximum size of a client request body, in bytes. Specify 0 for no limit.
+	DefaultMaxBodySize = 25e6
 )
 
 // Config represents a configuration for a HTTP service.
@@ -28,6 +33,7 @@ type Config struct {
 	Realm              string `toml:"realm"`
 	UnixSocketEnabled  bool   `toml:"unix-socket-enabled"`
 	BindSocket         string `toml:"bind-socket"`
+	MaxBodySize        int    `toml:"max-body-size"`
 }
 
 // NewConfig returns a new Config with default settings.
@@ -39,9 +45,27 @@ func NewConfig() Config {
 		PprofEnabled:      true,
 		HTTPSEnabled:      false,
 		HTTPSCertificate:  "/etc/ssl/influxdb.pem",
-		MaxRowLimit:       DefaultChunkSize,
+		MaxRowLimit:       0,
 		Realm:             DefaultRealm,
 		UnixSocketEnabled: false,
 		BindSocket:        DefaultBindSocket,
+		MaxBodySize:       DefaultMaxBodySize,
 	}
+}
+
+// Diagnostics returns a diagnostics representation of a subset of the Config.
+func (c Config) Diagnostics() (*diagnostics.Diagnostics, error) {
+	if !c.Enabled {
+		return diagnostics.RowFromMap(map[string]interface{}{
+			"enabled": false,
+		}), nil
+	}
+
+	return diagnostics.RowFromMap(map[string]interface{}{
+		"enabled":              true,
+		"bind-address":         c.BindAddress,
+		"https-enabled":        c.HTTPSEnabled,
+		"max-row-limit":        c.MaxRowLimit,
+		"max-connection-limit": c.MaxConnectionLimit,
+	}), nil
 }

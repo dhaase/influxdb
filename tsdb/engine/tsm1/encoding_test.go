@@ -142,6 +142,66 @@ func TestEncoding_IntBlock_Negatives(t *testing.T) {
 	}
 }
 
+func TestEncoding_UIntBlock_Basic(t *testing.T) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	values := make([]tsm1.Value, len(times))
+	for i, t := range times {
+		values[i] = tsm1.NewValue(t, uint64(i))
+	}
+
+	b, err := tsm1.Values(values).Encode(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var decodedValues []tsm1.Value
+	decodedValues, err = tsm1.DecodeBlock(b, decodedValues)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
+	}
+
+	if len(decodedValues) != len(values) {
+		t.Fatalf("unexpected results length:\n\tgot: %v\n\texp: %v\n", len(decodedValues), len(values))
+	}
+
+	for i := 0; i < len(decodedValues); i++ {
+		if decodedValues[i].UnixNano() != values[i].UnixNano() {
+			t.Fatalf("unexpected results:\n\tgot: %v\n\texp: %v\n", decodedValues[i].UnixNano(), values[i].UnixNano())
+		}
+
+		if decodedValues[i].Value() != values[i].Value() {
+			t.Fatalf("unexpected results:\n\tgot: %v\n\texp: %v\n", decodedValues[i].Value(), values[i].Value())
+		}
+	}
+}
+
+// TestEncoding_UIntBlock_MaxValues encodes uint64 numbers starting at max (18446744073709551615)
+// down to 18446744073709550616
+func TestEncoding_UIntBlock_MaxValues(t *testing.T) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	values := make([]tsm1.Value, len(times))
+	for i, t := range times {
+		values[i] = tsm1.NewValue(t, ^uint64(i))
+	}
+
+	b, err := tsm1.Values(values).Encode(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var decodedValues []tsm1.Value
+	decodedValues, err = tsm1.DecodeBlock(b, decodedValues)
+	if err != nil {
+		t.Fatalf("unexpected error decoding block: %v", err)
+	}
+
+	if !reflect.DeepEqual(decodedValues, values) {
+		t.Fatalf("unexpected results:\n\tgot: %v\n\texp: %v\n", decodedValues, values)
+	}
+}
+
 func TestEncoding_BooleanBlock_Basic(t *testing.T) {
 	valueCount := 1000
 	times := getTimes(valueCount, 60, time.Second)
@@ -201,6 +261,7 @@ func TestEncoding_BlockType(t *testing.T) {
 	}{
 		{value: float64(1.0), blockType: tsm1.BlockFloat64},
 		{value: int64(1), blockType: tsm1.BlockInteger},
+		{value: uint64(1), blockType: tsm1.BlockUnsigned},
 		{value: true, blockType: tsm1.BlockBoolean},
 		{value: "string", blockType: tsm1.BlockString},
 	}
@@ -237,6 +298,7 @@ func TestEncoding_Count(t *testing.T) {
 	}{
 		{value: float64(1.0), blockType: tsm1.BlockFloat64},
 		{value: int64(1), blockType: tsm1.BlockInteger},
+		{value: uint64(1), blockType: tsm1.BlockUnsigned},
 		{value: true, blockType: tsm1.BlockBoolean},
 		{value: "string", blockType: tsm1.BlockString},
 	}
@@ -488,7 +550,6 @@ func TestValues_MergeFloat(t *testing.T) {
 
 	for i, test := range tests {
 		got := tsm1.Values(test.a).Merge(test.b)
-
 		if exp, got := len(test.exp), len(got); exp != got {
 			t.Fatalf("test(%d): value length mismatch: exp %v, got %v", i, exp, got)
 		}
@@ -633,6 +694,145 @@ func TestIntegerValues_Merge(t *testing.T) {
 		}
 
 		dedup := tsm1.IntegerValues(append(test.a, test.b...)).Deduplicate()
+
+		for i := range test.exp {
+			if exp, got := test.exp[i].String(), got[i].String(); exp != got {
+				t.Fatalf("value mismatch:\n exp %v\n got %v", exp, got)
+			}
+
+			if exp, got := test.exp[i].String(), dedup[i].String(); exp != got {
+				t.Fatalf("value mismatch:\n exp %v\n got %v", exp, got)
+			}
+		}
+	}
+}
+
+func TestUnsignedValues_Merge(t *testing.T) {
+	uintValue := func(t int64, f uint64) tsm1.UnsignedValue {
+		return tsm1.NewValue(t, f).(tsm1.UnsignedValue)
+	}
+
+	tests := []struct {
+		a, b, exp []tsm1.UnsignedValue
+	}{
+
+		{ // empty a
+			a: []tsm1.UnsignedValue{},
+
+			b: []tsm1.UnsignedValue{
+				uintValue(1, 10),
+				uintValue(2, 20),
+			},
+			exp: []tsm1.UnsignedValue{
+				uintValue(1, 10),
+				uintValue(2, 20),
+			},
+		},
+		{ // empty b
+			a: []tsm1.UnsignedValue{
+				uintValue(1, 1),
+				uintValue(2, 2),
+			},
+
+			b: []tsm1.UnsignedValue{},
+			exp: []tsm1.UnsignedValue{
+				uintValue(1, 1),
+				uintValue(2, 2),
+			},
+		},
+		{
+			a: []tsm1.UnsignedValue{
+				uintValue(1, 1),
+			},
+			b: []tsm1.UnsignedValue{
+				uintValue(0, 0),
+				uintValue(1, 10), // overwrites a
+				uintValue(2, 20),
+				uintValue(3, 30),
+				uintValue(4, 40),
+			},
+			exp: []tsm1.UnsignedValue{
+				uintValue(0, 0),
+				uintValue(1, 10),
+				uintValue(2, 20),
+				uintValue(3, 30),
+				uintValue(4, 40),
+			},
+		},
+		{
+			a: []tsm1.UnsignedValue{
+				uintValue(1, 1),
+				uintValue(2, 2),
+				uintValue(3, 3),
+				uintValue(4, 4),
+			},
+
+			b: []tsm1.UnsignedValue{
+				uintValue(1, ^uint64(0)), // overwrites a
+				uintValue(2, 20),         // overwrites a
+			},
+			exp: []tsm1.UnsignedValue{
+				uintValue(1, ^uint64(0)),
+				uintValue(2, 20),
+				uintValue(3, 3),
+				uintValue(4, 4),
+			},
+		},
+		{
+			a: []tsm1.UnsignedValue{
+				uintValue(1, 1),
+				uintValue(2, 2),
+				uintValue(3, 3),
+				uintValue(4, 4),
+			},
+
+			b: []tsm1.UnsignedValue{
+				uintValue(1, 10), // overwrites a
+				uintValue(2, 20), // overwrites a
+				uintValue(3, 30),
+				uintValue(4, 40),
+			},
+			exp: []tsm1.UnsignedValue{
+				uintValue(1, 10),
+				uintValue(2, 20),
+				uintValue(3, 30),
+				uintValue(4, 40),
+			},
+		},
+		{
+			a: []tsm1.UnsignedValue{
+				uintValue(0, 0),
+				uintValue(1, 1),
+				uintValue(2, 2),
+				uintValue(3, 3),
+				uintValue(4, 4),
+			},
+			b: []tsm1.UnsignedValue{
+				uintValue(0, 0),
+				uintValue(2, 20),
+				uintValue(4, 40),
+			},
+			exp: []tsm1.UnsignedValue{
+				uintValue(0, 0.0),
+				uintValue(1, 1),
+				uintValue(2, 20),
+				uintValue(3, 3),
+				uintValue(4, 40),
+			},
+		},
+	}
+
+	for i, test := range tests {
+		if i != 2 {
+			continue
+		}
+
+		got := tsm1.UnsignedValues(test.a).Merge(test.b)
+		if exp, got := len(test.exp), len(got); exp != got {
+			t.Fatalf("test(%d): value length mismatch: exp %v, got %v", i, exp, got)
+		}
+
+		dedup := tsm1.UnsignedValues(append(test.a, test.b...)).Deduplicate()
 
 		for i := range test.exp {
 			if exp, got := test.exp[i].String(), got[i].String(); exp != got {
@@ -1366,8 +1566,96 @@ func BenchmarkValues_Merge(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	benchmarkMerge(a, c, b)
+}
+
+func BenchmarkValues_MergeDisjoint(b *testing.B) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	a := make([]tsm1.Value, len(times))
+	c := make([]tsm1.Value, len(times))
+
+	for i, t := range times {
+		a[i] = tsm1.NewValue(t, float64(i))
+		c[i] = tsm1.NewValue(times[len(times)-1]+int64((i+1)*1e9), float64(i))
+	}
+
+	b.ResetTimer()
+	benchmarkMerge(a, c, b)
+}
+
+func BenchmarkValues_MergeSame(b *testing.B) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	a := make([]tsm1.Value, len(times))
+	c := make([]tsm1.Value, len(times))
+
+	for i, t := range times {
+		a[i] = tsm1.NewValue(t, float64(i))
+		c[i] = tsm1.NewValue(t, float64(i))
+	}
+
+	b.ResetTimer()
+	benchmarkMerge(a, c, b)
+}
+
+func BenchmarkValues_MergeSimilar(b *testing.B) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	a := make([]tsm1.Value, len(times))
+	c := make([]tsm1.Value, len(times))
+
+	for i, t := range times {
+		a[i] = tsm1.NewValue(t, float64(i))
+		if i == 0 {
+			t++
+		}
+		c[i] = tsm1.NewValue(t, float64(i))
+	}
+
+	b.ResetTimer()
+	benchmarkMerge(a, c, b)
+}
+
+func BenchmarkValues_MergeUnevenA(b *testing.B) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	a := make([]tsm1.Value, len(times))
+	c := make([]tsm1.Value, len(times))
+
+	for i, t := range times {
+		a[i] = tsm1.NewValue(t, float64(i))
+		c[i] = tsm1.NewValue(t, float64(i))
+	}
+
+	b.ResetTimer()
+	benchmarkMerge(a[:700], c[:10], b)
+}
+
+func BenchmarkValues_MergeUnevenB(b *testing.B) {
+	valueCount := 1000
+	times := getTimes(valueCount, 60, time.Second)
+	a := make([]tsm1.Value, len(times))
+	c := make([]tsm1.Value, len(times))
+
+	for i, t := range times {
+		a[i] = tsm1.NewValue(t, float64(i))
+		c[i] = tsm1.NewValue(t, float64(i))
+	}
+
+	b.ResetTimer()
+	benchmarkMerge(a[:10], c[:700], b)
+}
+
+func benchmarkMerge(a, c tsm1.Values, b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		tsm1.Values(a).Merge(c)
+		b.StopTimer()
+		aa := make(tsm1.Values, len(a))
+		copy(aa, a)
+		cc := make(tsm1.Values, len(c))
+		copy(cc, c)
+		b.StartTimer()
+		tsm1.Values(aa).Merge(tsm1.Values(cc))
 	}
 }
 

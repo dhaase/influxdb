@@ -1,7 +1,6 @@
 package run
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -17,7 +16,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/influxdata/influxdb/coordinator"
 	"github.com/influxdata/influxdb/monitor"
-	"github.com/influxdata/influxdb/services/admin"
+	"github.com/influxdata/influxdb/monitor/diagnostics"
 	"github.com/influxdata/influxdb/services/collectd"
 	"github.com/influxdata/influxdb/services/continuous_querier"
 	"github.com/influxdata/influxdb/services/graphite"
@@ -26,14 +25,17 @@ import (
 	"github.com/influxdata/influxdb/services/opentsdb"
 	"github.com/influxdata/influxdb/services/precreator"
 	"github.com/influxdata/influxdb/services/retention"
+	"github.com/influxdata/influxdb/services/storage"
 	"github.com/influxdata/influxdb/services/subscriber"
 	"github.com/influxdata/influxdb/services/udp"
 	"github.com/influxdata/influxdb/tsdb"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 const (
 	// DefaultBindAddress is the default address for various RPC services.
-	DefaultBindAddress = ":8088"
+	DefaultBindAddress = "127.0.0.1:8088"
 )
 
 // Config represents the configuration format for the influxd binary.
@@ -44,10 +46,10 @@ type Config struct {
 	Retention   retention.Config   `toml:"retention"`
 	Precreator  precreator.Config  `toml:"shard-precreation"`
 
-	Admin          admin.Config      `toml:"admin"`
 	Monitor        monitor.Config    `toml:"monitor"`
 	Subscriber     subscriber.Config `toml:"subscriber"`
 	HTTPD          httpd.Config      `toml:"http"`
+	Storage        storage.Config    `toml:"storage"`
 	GraphiteInputs []graphite.Config `toml:"graphite"`
 	CollectdInputs []collectd.Config `toml:"collectd"`
 	OpenTSDBInputs []opentsdb.Config `toml:"opentsdb"`
@@ -70,10 +72,10 @@ func NewConfig() *Config {
 	c.Coordinator = coordinator.NewConfig()
 	c.Precreator = precreator.NewConfig()
 
-	c.Admin = admin.NewConfig()
 	c.Monitor = monitor.NewConfig()
 	c.Subscriber = subscriber.NewConfig()
 	c.HTTPD = httpd.NewConfig()
+	c.Storage = storage.NewConfig()
 
 	c.GraphiteInputs = []graphite.Config{graphite.NewConfig()}
 	c.CollectdInputs = []collectd.Config{collectd.NewConfig()}
@@ -109,20 +111,22 @@ func NewDemoConfig() (*Config, error) {
 	return c, nil
 }
 
-// trimBOM trims the Byte-Order-Marks from the beginning of the file.
-// This is for Windows compatability only.
-// See https://github.com/influxdata/telegraf/issues/1378.
-func trimBOM(f []byte) []byte {
-	return bytes.TrimPrefix(f, []byte("\xef\xbb\xbf"))
-}
-
 // FromTomlFile loads the config from a TOML file.
 func (c *Config) FromTomlFile(fpath string) error {
 	bs, err := ioutil.ReadFile(fpath)
 	if err != nil {
 		return err
 	}
-	bs = trimBOM(bs)
+
+	// Handle any potential Byte-Order-Marks that may be in the config file.
+	// This is for Windows compatibility only.
+	// See https://github.com/influxdata/telegraf/issues/1378 and
+	// https://github.com/influxdata/influxdb/issues/8965.
+	bom := unicode.BOMOverride(transform.Nop)
+	bs, _, err = transform.Bytes(bom, bs)
+	if err != nil {
+		return err
+	}
 	return c.FromToml(string(bs))
 }
 
@@ -187,18 +191,21 @@ func (c *Config) Validate() error {
 }
 
 // ApplyEnvOverrides apply the environment configuration on top of the config.
-func (c *Config) ApplyEnvOverrides() error {
-	return c.applyEnvOverrides("INFLUXDB", reflect.ValueOf(c), "")
+func (c *Config) ApplyEnvOverrides(getenv func(string) string) error {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	return c.applyEnvOverrides(getenv, "INFLUXDB", reflect.ValueOf(c), "")
 }
 
-func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value, structKey string) error {
+func (c *Config) applyEnvOverrides(getenv func(string) string, prefix string, spec reflect.Value, structKey string) error {
 	// If we have a pointer, dereference it
 	element := spec
 	if spec.Kind() == reflect.Ptr {
 		element = spec.Elem()
 	}
 
-	value := os.Getenv(prefix)
+	value := getenv(prefix)
 
 	switch element.Kind() {
 	case reflect.String:
@@ -246,11 +253,11 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value, structKey 
 		// If the type is s slice, apply to each using the index as a suffix, e.g. GRAPHITE_0, GRAPHITE_0_TEMPLATES_0 or GRAPHITE_0_TEMPLATES="item1,item2"
 		for j := 0; j < element.Len(); j++ {
 			f := element.Index(j)
-			if err := c.applyEnvOverrides(prefix, f, structKey); err != nil {
+			if err := c.applyEnvOverrides(getenv, prefix, f, structKey); err != nil {
 				return err
 			}
 
-			if err := c.applyEnvOverrides(fmt.Sprintf("%s_%d", prefix, j), f, structKey); err != nil {
+			if err := c.applyEnvOverrides(getenv, fmt.Sprintf("%s_%d", prefix, j), f, structKey); err != nil {
 				return err
 			}
 		}
@@ -287,22 +294,79 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value, structKey 
 			// If it's a sub-config, recursively apply
 			if field.Kind() == reflect.Struct || field.Kind() == reflect.Ptr ||
 				field.Kind() == reflect.Slice || field.Kind() == reflect.Array {
-				if err := c.applyEnvOverrides(envKey, field, fieldName); err != nil {
+				if err := c.applyEnvOverrides(getenv, envKey, field, fieldName); err != nil {
 					return err
 				}
 				continue
 			}
 
-			value := os.Getenv(envKey)
+			value := getenv(envKey)
 			// Skip any fields we don't have a value to set
 			if len(value) == 0 {
 				continue
 			}
 
-			if err := c.applyEnvOverrides(envKey, field, fieldName); err != nil {
+			if err := c.applyEnvOverrides(getenv, envKey, field, fieldName); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// Diagnostics returns a diagnostics representation of Config.
+func (c *Config) Diagnostics() (*diagnostics.Diagnostics, error) {
+	return diagnostics.RowFromMap(map[string]interface{}{
+		"reporting-disabled": c.ReportingDisabled,
+		"bind-address":       c.BindAddress,
+	}), nil
+}
+
+func (c *Config) diagnosticsClients() map[string]diagnostics.Client {
+	// Config settings that are always present.
+	m := map[string]diagnostics.Client{
+		"config": c,
+
+		"config-data":        c.Data,
+		"config-meta":        c.Meta,
+		"config-coordinator": c.Coordinator,
+		"config-retention":   c.Retention,
+		"config-precreator":  c.Precreator,
+
+		"config-monitor":    c.Monitor,
+		"config-subscriber": c.Subscriber,
+		"config-httpd":      c.HTTPD,
+
+		"config-cqs": c.ContinuousQuery,
+	}
+
+	// Config settings that can be repeated and can be disabled.
+	if g := graphite.Configs(c.GraphiteInputs); g.Enabled() {
+		m["config-graphite"] = g
+	}
+	if cc := collectd.Configs(c.CollectdInputs); cc.Enabled() {
+		m["config-collectd"] = cc
+	}
+	if t := opentsdb.Configs(c.OpenTSDBInputs); t.Enabled() {
+		m["config-opentsdb"] = t
+	}
+	if u := udp.Configs(c.UDPInputs); u.Enabled() {
+		m["config-udp"] = u
+	}
+
+	return m
+}
+
+// registerDiagnostics registers the config settings with the Monitor.
+func (c *Config) registerDiagnostics(m *monitor.Monitor) {
+	for name, dc := range c.diagnosticsClients() {
+		m.RegisterDiagnosticsClient(name, dc)
+	}
+}
+
+// registerDiagnostics deregisters the config settings from the Monitor.
+func (c *Config) deregisterDiagnostics(m *monitor.Monitor) {
+	for name := range c.diagnosticsClients() {
+		m.DeregisterDiagnosticsClient(name)
+	}
 }

@@ -2,7 +2,6 @@ package meta
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"sort"
@@ -13,9 +12,10 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/influxdata/influxdb"
-	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/query"
 	internal "github.com/influxdata/influxdb/services/meta/internal"
+	"github.com/influxdata/influxql"
 )
 
 //go:generate protoc --gogo_out=. internal/meta.proto
@@ -42,34 +42,12 @@ type Data struct {
 	Databases []DatabaseInfo
 	Users     []UserInfo
 
+	// adminUserExists provides a constant time mechanism for determining
+	// if there is at least one admin user.
+	adminUserExists bool
+
 	MaxShardGroupID uint64
 	MaxShardID      uint64
-}
-
-// NewShardOwner sets the owner of the provided shard to the data node
-// that currently owns the fewest number of shards. If multiple nodes
-// own the same (fewest) number of shards, then one of those nodes
-// becomes the new shard owner.
-func NewShardOwner(s ShardInfo, ownerFreqs map[int]int) (uint64, error) {
-	var (
-		minId   = -1
-		minFreq int
-	)
-
-	for id, freq := range ownerFreqs {
-		if minId == -1 || freq < minFreq {
-			minId, minFreq = int(id), freq
-		}
-	}
-
-	if minId < 0 {
-		return 0, fmt.Errorf("cannot reassign shard %d due to lack of data nodes", s.ID)
-	}
-
-	// Update the shard owner frequencies and set the new owner on the
-	// shard.
-	ownerFreqs[minId]++
-	return uint64(minId), nil
 }
 
 // Database returns a DatabaseInfo by the database name.
@@ -542,14 +520,23 @@ func (data *Data) DropSubscription(database, rp, name string) error {
 	return ErrSubscriptionNotFound
 }
 
-// User returns a user by username.
-func (data *Data) User(username string) *UserInfo {
+func (data *Data) user(username string) *UserInfo {
 	for i := range data.Users {
 		if data.Users[i].Name == username {
 			return &data.Users[i]
 		}
 	}
 	return nil
+}
+
+// User returns a user by username.
+func (data *Data) User(username string) User {
+	u := data.user(username)
+	if u == nil {
+		// prevent non-nil interface with nil pointer
+		return nil
+	}
+	return u
 }
 
 // CreateUser creates a new user.
@@ -568,6 +555,11 @@ func (data *Data) CreateUser(name, hash string, admin bool) error {
 		Admin: admin,
 	})
 
+	// We know there is now at least one admin user.
+	if admin {
+		data.adminUserExists = true
+	}
+
 	return nil
 }
 
@@ -575,10 +567,17 @@ func (data *Data) CreateUser(name, hash string, admin bool) error {
 func (data *Data) DropUser(name string) error {
 	for i := range data.Users {
 		if data.Users[i].Name == name {
+			wasAdmin := data.Users[i].Admin
 			data.Users = append(data.Users[:i], data.Users[i+1:]...)
+
+			// Maybe we dropped the only admin user?
+			if wasAdmin {
+				data.adminUserExists = data.hasAdminUser()
+			}
 			return nil
 		}
 	}
+
 	return ErrUserNotFound
 }
 
@@ -608,9 +607,13 @@ func (data *Data) CloneUsers() []UserInfo {
 
 // SetPrivilege sets a privilege for a user on a database.
 func (data *Data) SetPrivilege(name, database string, p influxql.Privilege) error {
-	ui := data.User(name)
+	ui := data.user(name)
 	if ui == nil {
 		return ErrUserNotFound
+	}
+
+	if data.Database(database) == nil {
+		return influxdb.ErrDatabaseNotFound(database)
 	}
 
 	if ui.Privileges == nil {
@@ -623,19 +626,27 @@ func (data *Data) SetPrivilege(name, database string, p influxql.Privilege) erro
 
 // SetAdminPrivilege sets the admin privilege for a user.
 func (data *Data) SetAdminPrivilege(name string, admin bool) error {
-	ui := data.User(name)
+	ui := data.user(name)
 	if ui == nil {
 		return ErrUserNotFound
 	}
 
 	ui.Admin = admin
 
+	// We could have promoted or revoked the only admin. Check if an admin
+	// user exists.
+	data.adminUserExists = data.hasAdminUser()
 	return nil
+}
+
+// AdminUserExists returns true if an admin user exists.
+func (data Data) AdminUserExists() bool {
+	return data.adminUserExists
 }
 
 // UserPrivileges gets the privileges for a user.
 func (data *Data) UserPrivileges(name string) (map[string]influxql.Privilege, error) {
-	ui := data.User(name)
+	ui := data.user(name)
 	if ui == nil {
 		return nil, ErrUserNotFound
 	}
@@ -645,7 +656,7 @@ func (data *Data) UserPrivileges(name string) (map[string]influxql.Privilege, er
 
 // UserPrivilege gets the privilege for a user on a database.
 func (data *Data) UserPrivilege(name, database string) (*influxql.Privilege, error) {
-	ui := data.User(name)
+	ui := data.user(name)
 	if ui == nil {
 		return nil, ErrUserNotFound
 	}
@@ -714,6 +725,10 @@ func (data *Data) unmarshal(pb *internal.Data) {
 	for i, x := range pb.GetUsers() {
 		data.Users[i].unmarshal(x)
 	}
+
+	// Exhaustively determine if there is an admin user. The marshalled cache
+	// value may not be correct.
+	data.adminUserExists = data.hasAdminUser()
 }
 
 // MarshalBinary encodes the metadata to a binary format.
@@ -729,6 +744,17 @@ func (data *Data) UnmarshalBinary(buf []byte) error {
 	}
 	data.unmarshal(&pb)
 	return nil
+}
+
+// hasAdminUser exhaustively checks for the presence of at least one admin
+// user.
+func (data *Data) hasAdminUser() bool {
+	for _, u := range data.Users {
+		if u.Admin {
+			return true
+		}
+	}
+	return false
 }
 
 // NodeInfo represents information about a single node in the cluster.
@@ -1407,6 +1433,8 @@ func (cqi *ContinuousQueryInfo) unmarshal(pb *internal.ContinuousQueryInfo) {
 	cqi.Query = pb.GetQuery()
 }
 
+var _ query.Authorizer = (*UserInfo)(nil)
+
 // UserInfo represents metadata about a user in the system.
 type UserInfo struct {
 	// User's name.
@@ -1422,7 +1450,19 @@ type UserInfo struct {
 	Privileges map[string]influxql.Privilege
 }
 
-var _ influxql.Authorizer = (*UserInfo)(nil)
+type User interface {
+	query.Authorizer
+	ID() string
+	IsAdmin() bool
+}
+
+func (u *UserInfo) ID() string {
+	return u.Name
+}
+
+func (u *UserInfo) IsAdmin() bool {
+	return u.Admin
+}
 
 // AuthorizeDatabase returns true if the user is authorized for the given privilege on the given database.
 func (ui *UserInfo) AuthorizeDatabase(privilege influxql.Privilege, database string) bool {
@@ -1431,6 +1471,16 @@ func (ui *UserInfo) AuthorizeDatabase(privilege influxql.Privilege, database str
 	}
 	p, ok := ui.Privileges[database]
 	return ok && (p == privilege || p == influxql.AllPrivileges)
+}
+
+// AuthorizeSeriesRead is used to limit access per-series (enterprise only)
+func (u *UserInfo) AuthorizeSeriesRead(database string, measurement []byte, tags models.Tags) bool {
+	return true
+}
+
+// AuthorizeSeriesWrite is used to limit access per-series (enterprise only)
+func (u *UserInfo) AuthorizeSeriesWrite(database string, measurement []byte, tags models.Tags) bool {
+	return true
 }
 
 // clone returns a deep copy of si.
@@ -1507,8 +1557,8 @@ func (leases *Leases) Acquire(name string, nodeID uint64) (*Lease, error) {
 	leases.mu.Lock()
 	defer leases.mu.Unlock()
 
-	l, ok := leases.m[name]
-	if ok {
+	l := leases.m[name]
+	if l != nil {
 		if time.Now().After(l.Expiration) || l.Owner == nodeID {
 			l.Expiration = time.Now().Add(leases.d)
 			l.Owner = nodeID

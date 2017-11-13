@@ -2,6 +2,7 @@
 package collectd // import "github.com/influxdata/influxdb/services/collectd"
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -17,7 +18,7 @@ import (
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/tsdb"
-	"github.com/uber-go/zap"
+	"go.uber.org/zap"
 )
 
 // statistics gathered by the collectd service.
@@ -34,7 +35,7 @@ const (
 
 // pointsWriter is an internal interface to make testing easier.
 type pointsWriter interface {
-	WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
+	WritePointsPrivileged(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
 }
 
 // metaClient is an internal interface to make testing easier.
@@ -58,7 +59,7 @@ type Service struct {
 	Config       *Config
 	MetaClient   metaClient
 	PointsWriter pointsWriter
-	Logger       zap.Logger
+	Logger       *zap.Logger
 
 	wg      sync.WaitGroup
 	conn    *net.UDPConn
@@ -81,7 +82,7 @@ func NewService(c Config) *Service {
 		// Use defaults where necessary.
 		Config: c.WithDefaults(),
 
-		Logger:      zap.New(zap.NullEncoder()),
+		Logger:      zap.NewNop(),
 		stats:       &Statistics{},
 		defaultTags: models.StatisticTags{"bind": c.BindAddress},
 	}
@@ -94,7 +95,7 @@ func (s *Service) Open() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.closed() {
+	if s.done != nil {
 		return nil // Already open.
 	}
 	s.done = make(chan struct{})
@@ -114,7 +115,10 @@ func (s *Service) Open() error {
 		if stat, err := os.Stat(s.Config.TypesDB); err != nil {
 			return fmt.Errorf("Stat(): %s", err)
 		} else if stat.IsDir() {
-			alltypesdb := new(api.TypesDB)
+			alltypesdb, err := api.NewTypesDB(&bytes.Buffer{})
+			if err != nil {
+				return err
+			}
 			var readdir func(path string)
 			readdir = func(path string) {
 				files, err := ioutil.ReadDir(path)
@@ -207,24 +211,34 @@ func (s *Service) Open() error {
 
 // Close stops the service.
 func (s *Service) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if wait := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	if s.closed() {
+		if s.closed() {
+			return false
+		}
+		close(s.done)
+
+		// Close the connection, and wait for the goroutine to exit.
+		if s.conn != nil {
+			s.conn.Close()
+		}
+		if s.batcher != nil {
+			s.batcher.Stop()
+		}
+		return true
+	}(); !wait {
 		return nil // Already closed.
 	}
-	close(s.done)
 
-	// Close the connection, and wait for the goroutine to exit.
-	if s.conn != nil {
-		s.conn.Close()
-	}
-	if s.batcher != nil {
-		s.batcher.Stop()
-	}
+	// Wait with the lock unlocked.
 	s.wg.Wait()
 
 	// Release all remaining resources.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.conn = nil
 	s.batcher = nil
 	s.Logger.Info("collectd UDP closed")
@@ -263,7 +277,7 @@ func (s *Service) createInternalStorage() error {
 }
 
 // WithLogger sets the service's logger.
-func (s *Service) WithLogger(log zap.Logger) {
+func (s *Service) WithLogger(log *zap.Logger) {
 	s.Logger = log.With(zap.String("service", "collectd"))
 }
 
@@ -349,8 +363,13 @@ func (s *Service) handleMessage(buffer []byte) {
 		s.Logger.Info(fmt.Sprintf("Collectd parse error: %s", err))
 		return
 	}
+	var points []models.Point
 	for _, valueList := range valueLists {
-		points := s.UnmarshalValueList(valueList)
+		if s.Config.ParseMultiValuePlugin == "join" {
+			points = s.UnmarshalValueListPacked(valueList)
+		} else {
+			points = s.UnmarshalValueList(valueList)
+		}
 		for _, p := range points {
 			s.batcher.In() <- p
 		}
@@ -370,7 +389,7 @@ func (s *Service) writePoints() {
 				continue
 			}
 
-			if err := s.PointsWriter.WritePoints(s.Config.Database, s.Config.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
+			if err := s.PointsWriter.WritePointsPrivileged(s.Config.Database, s.Config.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
 				atomic.AddInt64(&s.stats.BatchesTransmitted, 1)
 				atomic.AddInt64(&s.stats.PointsTransmitted, int64(len(batch)))
 			} else {
@@ -381,6 +400,53 @@ func (s *Service) writePoints() {
 	}
 }
 
+// UnmarshalValueListPacked is an alternative to the original UnmarshalValueList.
+// The difference is that the original provided measurements like (PLUGIN_DSNAME, ["value",xxx])
+// while this one will provide measurements like (PLUGIN, {["DSNAME",xxx]}).
+// This effectively joins collectd data that should go together, such as:
+// (df, {["used",1000],["free",2500]}).
+func (s *Service) UnmarshalValueListPacked(vl *api.ValueList) []models.Point {
+	timestamp := vl.Time.UTC()
+
+	var name = vl.Identifier.Plugin
+	tags := make(map[string]string, 4)
+	fields := make(map[string]interface{}, len(vl.Values))
+
+	if vl.Identifier.Host != "" {
+		tags["host"] = vl.Identifier.Host
+	}
+	if vl.Identifier.PluginInstance != "" {
+		tags["instance"] = vl.Identifier.PluginInstance
+	}
+	if vl.Identifier.Type != "" {
+		tags["type"] = vl.Identifier.Type
+	}
+	if vl.Identifier.TypeInstance != "" {
+		tags["type_instance"] = vl.Identifier.TypeInstance
+	}
+
+	for i, v := range vl.Values {
+		fieldName := vl.DSName(i)
+		switch value := v.(type) {
+		case api.Gauge:
+			fields[fieldName] = float64(value)
+		case api.Derive:
+			fields[fieldName] = float64(value)
+		case api.Counter:
+			fields[fieldName] = float64(value)
+		}
+	}
+	// Drop invalid points
+	p, err := models.NewPoint(name, models.NewTags(tags), fields, timestamp)
+	if err != nil {
+		s.Logger.Info(fmt.Sprintf("Dropping point %v: %v", name, err))
+		atomic.AddInt64(&s.stats.InvalidDroppedPoints, 1)
+		return nil
+	}
+
+	return []models.Point{p}
+}
+
 // UnmarshalValueList translates a ValueList into InfluxDB data points.
 func (s *Service) UnmarshalValueList(vl *api.ValueList) []models.Point {
 	timestamp := vl.Time.UTC()
@@ -389,8 +455,8 @@ func (s *Service) UnmarshalValueList(vl *api.ValueList) []models.Point {
 	for i := range vl.Values {
 		var name string
 		name = fmt.Sprintf("%s_%s", vl.Identifier.Plugin, vl.DSName(i))
-		tags := make(map[string]string)
-		fields := make(map[string]interface{})
+		tags := make(map[string]string, 4)
+		fields := make(map[string]interface{}, 1)
 
 		// Convert interface back to actual type, then to float64
 		switch value := vl.Values[i].(type) {

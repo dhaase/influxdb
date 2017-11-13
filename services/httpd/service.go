@@ -14,29 +14,34 @@ import (
 	"time"
 
 	"github.com/influxdata/influxdb/models"
-	"github.com/uber-go/zap"
+	"go.uber.org/zap"
 )
 
 // statistics gathered by the httpd package.
 const (
-	statRequest                      = "req"                  // Number of HTTP requests served
-	statQueryRequest                 = "queryReq"             // Number of query requests served
-	statWriteRequest                 = "writeReq"             // Number of write requests serverd
-	statPingRequest                  = "pingReq"              // Number of ping requests served
-	statStatusRequest                = "statusReq"            // Number of status requests served
-	statWriteRequestBytesReceived    = "writeReqBytes"        // Sum of all bytes in write requests
-	statQueryRequestBytesTransmitted = "queryRespBytes"       // Sum of all bytes returned in query reponses
-	statPointsWrittenOK              = "pointsWrittenOK"      // Number of points written OK
-	statPointsWrittenDropped         = "pointsWrittenDropped" // Number of points dropped by the storage engine
-	statPointsWrittenFail            = "pointsWrittenFail"    // Number of points that failed to be written
-	statAuthFail                     = "authFail"             // Number of authentication failures
-	statRequestDuration              = "reqDurationNs"        // Number of (wall-time) nanoseconds spent inside requests
-	statQueryRequestDuration         = "queryReqDurationNs"   // Number of (wall-time) nanoseconds spent inside query requests
-	statWriteRequestDuration         = "writeReqDurationNs"   // Number of (wall-time) nanoseconds spent inside write requests
-	statRequestsActive               = "reqActive"            // Number of currently active requests
-	statWriteRequestsActive          = "writeReqActive"       // Number of currently active write requests
-	statClientError                  = "clientError"          // Number of HTTP responses due to client error
-	statServerError                  = "serverError"          // Number of HTTP responses due to server error
+	statRequest                      = "req"                  // Number of HTTP requests served.
+	statQueryRequest                 = "queryReq"             // Number of query requests served.
+	statWriteRequest                 = "writeReq"             // Number of write requests serverd.
+	statPingRequest                  = "pingReq"              // Number of ping requests served.
+	statStatusRequest                = "statusReq"            // Number of status requests served.
+	statWriteRequestBytesReceived    = "writeReqBytes"        // Sum of all bytes in write requests.
+	statQueryRequestBytesTransmitted = "queryRespBytes"       // Sum of all bytes returned in query reponses.
+	statPointsWrittenOK              = "pointsWrittenOK"      // Number of points written OK.
+	statPointsWrittenDropped         = "pointsWrittenDropped" // Number of points dropped by the storage engine.
+	statPointsWrittenFail            = "pointsWrittenFail"    // Number of points that failed to be written.
+	statAuthFail                     = "authFail"             // Number of authentication failures.
+	statRequestDuration              = "reqDurationNs"        // Number of (wall-time) nanoseconds spent inside requests.
+	statQueryRequestDuration         = "queryReqDurationNs"   // Number of (wall-time) nanoseconds spent inside query requests.
+	statWriteRequestDuration         = "writeReqDurationNs"   // Number of (wall-time) nanoseconds spent inside write requests.
+	statRequestsActive               = "reqActive"            // Number of currently active requests.
+	statWriteRequestsActive          = "writeReqActive"       // Number of currently active write requests.
+	statClientError                  = "clientError"          // Number of HTTP responses due to client error.
+	statServerError                  = "serverError"          // Number of HTTP responses due to server error.
+	statRecoveredPanics              = "recoveredPanics"      // Number of panics recovered by HTTP handler.
+
+	// Prometheus stats
+	statPromWriteRequest = "promWriteReq" // Number of write requests to the promtheus endpoint
+	statPromReadRequest  = "promReadReq"  // Number of read requests to the prometheus endpoint
 )
 
 // Service manages the listener and handler for an HTTP endpoint.
@@ -55,7 +60,7 @@ type Service struct {
 
 	Handler *Handler
 
-	Logger zap.Logger
+	Logger *zap.Logger
 }
 
 // NewService returns a new instance of Service.
@@ -70,7 +75,7 @@ func NewService(c Config) *Service {
 		unixSocket: c.UnixSocketEnabled,
 		bindSocket: c.BindSocket,
 		Handler:    NewHandler(c),
-		Logger:     zap.New(zap.NullEncoder()),
+		Logger:     zap.NewNop(),
 	}
 	if s.key == "" {
 		s.key = s.cert
@@ -172,7 +177,7 @@ func (s *Service) Close() error {
 }
 
 // WithLogger sets the logger for the service.
-func (s *Service) WithLogger(log zap.Logger) {
+func (s *Service) WithLogger(log *zap.Logger) {
 	s.Logger = log.With(zap.String("service", "httpd"))
 	s.Handler.Logger = s.Logger
 }
@@ -191,6 +196,12 @@ func (s *Service) Addr() net.Addr {
 // Statistics returns statistics for periodic monitoring.
 func (s *Service) Statistics(tags map[string]string) []models.Statistic {
 	return s.Handler.Statistics(models.NewTags(map[string]string{"bind": s.addr}).Merge(tags).Map())
+}
+
+// BoundHTTPAddr returns the string version of the address that the HTTP server is listening on.
+// This is useful if you start an ephemeral server in test with bind address localhost:0.
+func (s *Service) BoundHTTPAddr() string {
+	return s.ln.Addr().String()
 }
 
 // serveTCP serves the handler from the TCP listener.

@@ -5,7 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxql"
 
 	"github.com/influxdata/influxdb/services/meta"
 )
@@ -107,6 +108,110 @@ func Test_Data_CreateRetentionPolicy(t *testing.T) {
 	}, false)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestData_AdminUserExists(t *testing.T) {
+	data := meta.Data{}
+
+	// No users means no admin.
+	if data.AdminUserExists() {
+		t.Fatal("no admin user should exist")
+	}
+
+	// Add a non-admin user.
+	if err := data.CreateUser("user1", "a", false); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), false; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Add an admin user.
+	if err := data.CreateUser("admin1", "a", true); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), true; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Remove the original user
+	if err := data.DropUser("user1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), true; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Add another admin
+	if err := data.CreateUser("admin2", "a", true); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), true; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Revoke privileges of the first admin
+	if err := data.SetAdminPrivilege("admin1", false); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), true; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Add user1 back.
+	if err := data.CreateUser("user1", "a", false); err != nil {
+		t.Fatal(err)
+	}
+	// Revoke remaining admin.
+	if err := data.SetAdminPrivilege("admin2", false); err != nil {
+		t.Fatal(err)
+	}
+	// No longer any admins
+	if got, exp := data.AdminUserExists(), false; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Make user1 an admin
+	if err := data.SetAdminPrivilege("user1", true); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), true; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Drop user1...
+	if err := data.DropUser("user1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, exp := data.AdminUserExists(), false; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+}
+
+func TestData_SetPrivilege(t *testing.T) {
+	data := meta.Data{}
+	if err := data.CreateDatabase("db0"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := data.CreateUser("user1", "", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// When the user does not exist, SetPrivilege returns an error.
+	if got, exp := data.SetPrivilege("not a user", "db0", influxql.AllPrivileges), meta.ErrUserNotFound; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// When the database does not exist, SetPrivilege returns an error.
+	if got, exp := data.SetPrivilege("user1", "db1", influxql.AllPrivileges), influxdb.ErrDatabaseNotFound("db1"); got == nil || got.Error() != exp.Error() {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	// Otherwise, SetPrivilege sets the expected privileges.
+	if got := data.SetPrivilege("user1", "db0", influxql.AllPrivileges); got != nil {
+		t.Fatalf("got %v, expected %v", got, nil)
 	}
 }
 

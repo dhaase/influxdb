@@ -20,6 +20,10 @@ func (c *KeyCursor) ReadFloatBlock(buf *[]FloatValue) ([]FloatValue, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.col != nil {
+		c.col.GetCounter(floatBlocksDecodedCounter).Add(1)
+		c.col.GetCounter(floatBlocksSizeCounter).Add(int64(first.entry.Size))
+	}
 
 	// Remove values we already read
 	values = FloatValues(values).Exclude(first.readMin, first.readMax)
@@ -88,6 +92,11 @@ func (c *KeyCursor) ReadFloatBlock(buf *[]FloatValue) ([]FloatValue, error) {
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(floatBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(floatBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterFloatValues(tombstones, v)
 
@@ -147,6 +156,11 @@ func (c *KeyCursor) ReadFloatBlock(buf *[]FloatValue) ([]FloatValue, error) {
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(floatBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(floatBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterFloatValues(tombstones, v)
 
@@ -182,6 +196,10 @@ func (c *KeyCursor) ReadIntegerBlock(buf *[]IntegerValue) ([]IntegerValue, error
 	values, err := first.r.ReadIntegerBlockAt(&first.entry, buf)
 	if err != nil {
 		return nil, err
+	}
+	if c.col != nil {
+		c.col.GetCounter(integerBlocksDecodedCounter).Add(1)
+		c.col.GetCounter(integerBlocksSizeCounter).Add(int64(first.entry.Size))
 	}
 
 	// Remove values we already read
@@ -251,6 +269,11 @@ func (c *KeyCursor) ReadIntegerBlock(buf *[]IntegerValue) ([]IntegerValue, error
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(integerBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(integerBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterIntegerValues(tombstones, v)
 
@@ -310,6 +333,11 @@ func (c *KeyCursor) ReadIntegerBlock(buf *[]IntegerValue) ([]IntegerValue, error
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(integerBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(integerBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterIntegerValues(tombstones, v)
 
@@ -322,6 +350,183 @@ func (c *KeyCursor) ReadIntegerBlock(buf *[]IntegerValue) ([]IntegerValue, error
 				v = IntegerValues(v).Include(minT, maxT)
 				// Merge the remaing values with the existing
 				values = IntegerValues(v).Merge(values)
+			}
+			cur.markRead(minT, maxT)
+		}
+	}
+
+	first.markRead(minT, maxT)
+
+	return values, err
+}
+
+// ReadUnsignedBlock reads the next block as a set of unsigned values.
+func (c *KeyCursor) ReadUnsignedBlock(buf *[]UnsignedValue) ([]UnsignedValue, error) {
+	// No matching blocks to decode
+	if len(c.current) == 0 {
+		return nil, nil
+	}
+
+	// First block is the oldest block containing the points we're searching for.
+	first := c.current[0]
+	*buf = (*buf)[:0]
+	values, err := first.r.ReadUnsignedBlockAt(&first.entry, buf)
+	if err != nil {
+		return nil, err
+	}
+	if c.col != nil {
+		c.col.GetCounter(unsignedBlocksDecodedCounter).Add(1)
+		c.col.GetCounter(unsignedBlocksSizeCounter).Add(int64(first.entry.Size))
+	}
+
+	// Remove values we already read
+	values = UnsignedValues(values).Exclude(first.readMin, first.readMax)
+
+	// Remove any tombstones
+	tombstones := first.r.TombstoneRange(c.key)
+	values = c.filterUnsignedValues(tombstones, values)
+
+	// Check we have remaining values.
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	// Only one block with this key and time range so return it
+	if len(c.current) == 1 {
+		if len(values) > 0 {
+			first.markRead(values[0].UnixNano(), values[len(values)-1].UnixNano())
+		}
+		return values, nil
+	}
+
+	// Use the current block time range as our overlapping window
+	minT, maxT := first.readMin, first.readMax
+	if len(values) > 0 {
+		minT, maxT = values[0].UnixNano(), values[len(values)-1].UnixNano()
+	}
+	if c.ascending {
+		// Blocks are ordered by generation, we may have values in the past in later blocks, if so,
+		// expand the window to include the min time range to ensure values are returned in ascending
+		// order
+		for i := 1; i < len(c.current); i++ {
+			cur := c.current[i]
+			if cur.entry.MinTime < minT && !cur.read() {
+				minT = cur.entry.MinTime
+			}
+		}
+
+		// Find first block that overlaps our window
+		for i := 1; i < len(c.current); i++ {
+			cur := c.current[i]
+			if cur.entry.OverlapsTimeRange(minT, maxT) && !cur.read() {
+				// Shrink our window so it's the intersection of the first overlapping block and the
+				// first block.  We do this to minimize the region that overlaps and needs to
+				// be merged.
+				if cur.entry.MaxTime > maxT {
+					maxT = cur.entry.MaxTime
+				}
+				values = UnsignedValues(values).Include(minT, maxT)
+				break
+			}
+		}
+
+		// Search the remaining blocks that overlap our window and append their values so we can
+		// merge them.
+		for i := 1; i < len(c.current); i++ {
+			cur := c.current[i]
+			// Skip this block if it doesn't contain points we looking for or they have already been read
+			if !cur.entry.OverlapsTimeRange(minT, maxT) || cur.read() {
+				cur.markRead(minT, maxT)
+				continue
+			}
+
+			tombstones := cur.r.TombstoneRange(c.key)
+			var a []UnsignedValue
+			v, err := cur.r.ReadUnsignedBlockAt(&cur.entry, &a)
+			if err != nil {
+				return nil, err
+			}
+			if c.col != nil {
+				c.col.GetCounter(unsignedBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(unsignedBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
+			// Remove any tombstoned values
+			v = c.filterUnsignedValues(tombstones, v)
+
+			// Remove values we already read
+			v = UnsignedValues(v).Exclude(cur.readMin, cur.readMax)
+
+			if len(v) > 0 {
+				// Only use values in the overlapping window
+				v = UnsignedValues(v).Include(minT, maxT)
+
+				// Merge the remaing values with the existing
+				values = UnsignedValues(values).Merge(v)
+			}
+			cur.markRead(minT, maxT)
+		}
+
+	} else {
+		// Blocks are ordered by generation, we may have values in the past in later blocks, if so,
+		// expand the window to include the max time range to ensure values are returned in descending
+		// order
+		for i := 1; i < len(c.current); i++ {
+			cur := c.current[i]
+			if cur.entry.MaxTime > maxT && !cur.read() {
+				maxT = cur.entry.MaxTime
+			}
+		}
+
+		// Find first block that overlaps our window
+		for i := 1; i < len(c.current); i++ {
+			cur := c.current[i]
+			if cur.entry.OverlapsTimeRange(minT, maxT) && !cur.read() {
+				// Shrink our window so it's the intersection of the first overlapping block and the
+				// first block.  We do this to minimize the region that overlaps and needs to
+				// be merged.
+				if cur.entry.MinTime < minT {
+					minT = cur.entry.MinTime
+				}
+				values = UnsignedValues(values).Include(minT, maxT)
+				break
+			}
+		}
+
+		// Search the remaining blocks that overlap our window and append their values so we can
+		// merge them.
+		for i := 1; i < len(c.current); i++ {
+			cur := c.current[i]
+			// Skip this block if it doesn't contain points we looking for or they have already been read
+			if !cur.entry.OverlapsTimeRange(minT, maxT) || cur.read() {
+				cur.markRead(minT, maxT)
+				continue
+			}
+
+			tombstones := cur.r.TombstoneRange(c.key)
+
+			var a []UnsignedValue
+			v, err := cur.r.ReadUnsignedBlockAt(&cur.entry, &a)
+			if err != nil {
+				return nil, err
+			}
+			if c.col != nil {
+				c.col.GetCounter(unsignedBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(unsignedBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
+			// Remove any tombstoned values
+			v = c.filterUnsignedValues(tombstones, v)
+
+			// Remove values we already read
+			v = UnsignedValues(v).Exclude(cur.readMin, cur.readMax)
+
+			// If the block we decoded should have all of it's values included, mark it as read so we
+			// don't use it again.
+			if len(v) > 0 {
+				v = UnsignedValues(v).Include(minT, maxT)
+				// Merge the remaing values with the existing
+				values = UnsignedValues(v).Merge(values)
 			}
 			cur.markRead(minT, maxT)
 		}
@@ -345,6 +550,10 @@ func (c *KeyCursor) ReadStringBlock(buf *[]StringValue) ([]StringValue, error) {
 	values, err := first.r.ReadStringBlockAt(&first.entry, buf)
 	if err != nil {
 		return nil, err
+	}
+	if c.col != nil {
+		c.col.GetCounter(stringBlocksDecodedCounter).Add(1)
+		c.col.GetCounter(stringBlocksSizeCounter).Add(int64(first.entry.Size))
 	}
 
 	// Remove values we already read
@@ -414,6 +623,11 @@ func (c *KeyCursor) ReadStringBlock(buf *[]StringValue) ([]StringValue, error) {
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(stringBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(stringBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterStringValues(tombstones, v)
 
@@ -473,6 +687,11 @@ func (c *KeyCursor) ReadStringBlock(buf *[]StringValue) ([]StringValue, error) {
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(stringBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(stringBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterStringValues(tombstones, v)
 
@@ -508,6 +727,10 @@ func (c *KeyCursor) ReadBooleanBlock(buf *[]BooleanValue) ([]BooleanValue, error
 	values, err := first.r.ReadBooleanBlockAt(&first.entry, buf)
 	if err != nil {
 		return nil, err
+	}
+	if c.col != nil {
+		c.col.GetCounter(booleanBlocksDecodedCounter).Add(1)
+		c.col.GetCounter(booleanBlocksSizeCounter).Add(int64(first.entry.Size))
 	}
 
 	// Remove values we already read
@@ -577,6 +800,11 @@ func (c *KeyCursor) ReadBooleanBlock(buf *[]BooleanValue) ([]BooleanValue, error
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(booleanBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(booleanBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterBooleanValues(tombstones, v)
 
@@ -636,6 +864,11 @@ func (c *KeyCursor) ReadBooleanBlock(buf *[]BooleanValue) ([]BooleanValue, error
 			if err != nil {
 				return nil, err
 			}
+			if c.col != nil {
+				c.col.GetCounter(booleanBlocksDecodedCounter).Add(1)
+				c.col.GetCounter(booleanBlocksSizeCounter).Add(int64(cur.entry.Size))
+			}
+
 			// Remove any tombstoned values
 			v = c.filterBooleanValues(tombstones, v)
 

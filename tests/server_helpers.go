@@ -12,7 +12,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"testing"
+	"sync"
 	"time"
 
 	"github.com/influxdata/influxdb/cmd/influxd/run"
@@ -21,6 +21,9 @@ import (
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/toml"
 )
+
+var verboseServerLogs bool
+var indexType string
 
 // Server represents a test wrapper for run.Server.
 type Server interface {
@@ -33,6 +36,7 @@ type Server interface {
 	CreateDatabase(db string) (*meta.DatabaseInfo, error)
 	CreateDatabaseAndRetentionPolicy(db string, rp *meta.RetentionPolicySpec, makeDefault bool) error
 	CreateSubscription(database, rp, name, mode string, destinations []string) error
+	DropDatabase(db string) error
 	Reset() error
 
 	Query(query string) (results string, err error)
@@ -40,14 +44,7 @@ type Server interface {
 
 	Write(db, rp, body string, params url.Values) (results string, err error)
 	MustWrite(db, rp, body string, params url.Values) string
-	WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
-}
-
-// LocalServer is a Server that is running in-process and can be accessed directly
-type LocalServer struct {
-	*client
-	*run.Server
-	Config *run.Config
+	WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, user meta.User, points []models.Point) error
 }
 
 // RemoteServer is a Server that is accessed remotely via the HTTP API
@@ -160,7 +157,7 @@ func (s *RemoteServer) Reset() error {
 
 }
 
-func (s *RemoteServer) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error {
+func (s *RemoteServer) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, user meta.User, points []models.Point) error {
 	panic("WritePoints not implemented")
 }
 
@@ -247,8 +244,20 @@ func OpenDefaultServer(c *run.Config) Server {
 	return s
 }
 
+// LocalServer is a Server that is running in-process and can be accessed directly
+type LocalServer struct {
+	mu sync.RWMutex
+	*run.Server
+
+	*client
+	Config *run.Config
+}
+
 // Close shuts down the server and removes all temporary paths.
 func (s *LocalServer) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if err := s.Server.Close(); err != nil {
 		panic(err.Error())
 	}
@@ -264,11 +273,15 @@ func (s *LocalServer) Close() {
 }
 
 func (s *LocalServer) Closed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.Server == nil
 }
 
 // URL returns the base URL for the httpd endpoint.
 func (s *LocalServer) URL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, service := range s.Services {
 		if service, ok := service.(*httpd.Service); ok {
 			return "http://" + service.Addr().String()
@@ -278,11 +291,15 @@ func (s *LocalServer) URL() string {
 }
 
 func (s *LocalServer) CreateDatabase(db string) (*meta.DatabaseInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.MetaClient.CreateDatabase(db)
 }
 
 // CreateDatabaseAndRetentionPolicy will create the database and retention policy.
 func (s *LocalServer) CreateDatabaseAndRetentionPolicy(db string, rp *meta.RetentionPolicySpec, makeDefault bool) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if _, err := s.MetaClient.CreateDatabase(db); err != nil {
 		return err
 	} else if _, err := s.MetaClient.CreateRetentionPolicy(db, rp, makeDefault); err != nil {
@@ -292,20 +309,36 @@ func (s *LocalServer) CreateDatabaseAndRetentionPolicy(db string, rp *meta.Reten
 }
 
 func (s *LocalServer) CreateSubscription(database, rp, name, mode string, destinations []string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.MetaClient.CreateSubscription(database, rp, name, mode, destinations)
 }
 
 func (s *LocalServer) DropDatabase(db string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if err := s.TSDBStore.DeleteDatabase(db); err != nil {
+		return err
+	}
 	return s.MetaClient.DropDatabase(db)
 }
 
 func (s *LocalServer) Reset() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, db := range s.MetaClient.Databases() {
 		if err := s.DropDatabase(db.Name); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *LocalServer) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, user meta.User, points []models.Point) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.PointsWriter.WritePoints(database, retentionPolicy, consistencyLevel, user, points)
 }
 
 // client abstract querying and writing to a Server using HTTP
@@ -410,10 +443,6 @@ func (wr WriteError) Error() string {
 	return fmt.Sprintf("invalid status code: code=%d, body=%s", wr.statusCode, wr.body)
 }
 
-func (s *LocalServer) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error {
-	return s.PointsWriter.WritePoints(database, retentionPolicy, consistencyLevel, points)
-}
-
 // Write executes a write against the server and returns the results.
 func (s *client) Write(db, rp, body string, params url.Values) (results string, err error) {
 	if params == nil {
@@ -450,19 +479,21 @@ func NewConfig() *run.Config {
 	c.ReportingDisabled = true
 	c.Coordinator.WriteTimeout = toml.Duration(30 * time.Second)
 	c.Meta.Dir = MustTempFile()
-
-	if !testing.Verbose() {
-		c.Meta.LoggingEnabled = false
-	}
+	c.Meta.LoggingEnabled = verboseServerLogs
 
 	c.Data.Dir = MustTempFile()
 	c.Data.WALDir = MustTempFile()
+	c.Data.QueryLogEnabled = verboseServerLogs
+	c.Data.TraceLoggingEnabled = verboseServerLogs
+	c.Data.Index = indexType
 
 	c.HTTPD.Enabled = true
 	c.HTTPD.BindAddress = "127.0.0.1:0"
-	c.HTTPD.LogEnabled = testing.Verbose()
+	c.HTTPD.LogEnabled = verboseServerLogs
 
 	c.Monitor.StoreEnabled = false
+
+	c.Storage.Enabled = false
 
 	return c
 }
@@ -491,6 +522,16 @@ func mustParseTime(layout, value string) time.Time {
 	}
 	return tm
 }
+
+func mustParseLocation(tzname string) *time.Location {
+	loc, err := time.LoadLocation(tzname)
+	if err != nil {
+		panic(err)
+	}
+	return loc
+}
+
+var LosAngeles = mustParseLocation("America/Los_Angeles")
 
 // MustReadAll reads r. Panic on error.
 func MustReadAll(r io.Reader) []byte {
@@ -687,7 +728,7 @@ func writeTestData(s Server, t *Test) error {
 
 func configureLogging(s Server) {
 	// Set the logger to discard unless verbose is on
-	if !testing.Verbose() {
+	if !verboseServerLogs {
 		s.SetLogOutput(ioutil.Discard)
 	}
 }

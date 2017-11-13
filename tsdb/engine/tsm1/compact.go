@@ -13,6 +13,7 @@ package tsm1
 // one-pass writing of a new TSM file.
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"os"
@@ -37,12 +38,33 @@ const (
 )
 
 var (
-	errMaxFileExceeded      = fmt.Errorf("max file exceeded")
-	errSnapshotsDisabled    = fmt.Errorf("snapshots disabled")
-	errCompactionsDisabled  = fmt.Errorf("compactions disabled")
-	errCompactionAborted    = fmt.Errorf("compaction aborted")
-	errCompactionInProgress = fmt.Errorf("compaction in progress")
+	errMaxFileExceeded     = fmt.Errorf("max file exceeded")
+	errSnapshotsDisabled   = fmt.Errorf("snapshots disabled")
+	errCompactionsDisabled = fmt.Errorf("compactions disabled")
 )
+
+type errCompactionInProgress struct {
+	err error
+}
+
+// Error returns the string representation of the error, to satisfy the error interface.
+func (e errCompactionInProgress) Error() string {
+	if e.err != nil {
+		return fmt.Sprintf("compaction in progress: %s", e.err)
+	}
+	return "compaction in progress"
+}
+
+type errCompactionAborted struct {
+	err error
+}
+
+func (e errCompactionAborted) Error() string {
+	if e.err != nil {
+		return fmt.Sprintf("compaction aborted: %s", e.err)
+	}
+	return "compaction aborted"
+}
 
 // CompactionGroup represents a list of files eligible to be compacted together.
 type CompactionGroup []string
@@ -53,6 +75,8 @@ type CompactionPlanner interface {
 	Plan(lastWrite time.Time) []CompactionGroup
 	PlanLevel(level int) []CompactionGroup
 	PlanOptimize() []CompactionGroup
+	Release(group []CompactionGroup)
+	FullyCompacted() bool
 }
 
 // DefaultPlanner implements CompactionPlanner using a strategy to roll up
@@ -60,17 +84,13 @@ type CompactionPlanner interface {
 // to minimize the number of TSM files on disk while rolling up a bounder number
 // of files.
 type DefaultPlanner struct {
-	FileStore interface {
-		Stats() []FileStat
-		LastModified() time.Time
-		BlockCount(path string, idx int) int
-	}
+	FileStore fileStore
 
-	// CompactFullWriteColdDuration specifies the length of time after
+	// compactFullWriteColdDuration specifies the length of time after
 	// which if no writes have been committed to the WAL, the engine will
 	// do a full compaction of the TSM files in this shard. This duration
 	// should always be greater than the CacheFlushWriteColdDuraion
-	CompactFullWriteColdDuration time.Duration
+	compactFullWriteColdDuration time.Duration
 
 	// lastPlanCheck is the last time Plan was called
 	lastPlanCheck time.Time
@@ -81,6 +101,24 @@ type DefaultPlanner struct {
 
 	// lastGenerations is the last set of generations found by findGenerations
 	lastGenerations tsmGenerations
+
+	// filesInUse is the set of files that have been returned as part of a plan and might
+	// be being compacted.  Two plans should not return the same file at any given time.
+	filesInUse map[string]struct{}
+}
+
+type fileStore interface {
+	Stats() []FileStat
+	LastModified() time.Time
+	BlockCount(path string, idx int) int
+}
+
+func NewDefaultPlanner(fs fileStore, writeColdDuration time.Duration) *DefaultPlanner {
+	return &DefaultPlanner{
+		FileStore:                    fs,
+		compactFullWriteColdDuration: writeColdDuration,
+		filesInUse:                   make(map[string]struct{}),
+	}
 }
 
 // tsmGeneration represents the TSM files within a generation.
@@ -129,12 +167,18 @@ func (t *tsmGeneration) hasTombstones() bool {
 	return false
 }
 
+// FullyCompacted returns true if the shard is fully compacted.
+func (c *DefaultPlanner) FullyCompacted() bool {
+	gens := c.findGenerations(false)
+	return len(gens) <= 1 && !gens.hasTombstones()
+}
+
 // PlanLevel returns a set of TSM files to rewrite for a specific level.
 func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 	// Determine the generations from all files on disk.  We need to treat
 	// a generation conceptually as a single file even though it may be
 	// split across several files in sequence.
-	generations := c.findGenerations()
+	generations := c.findGenerations(true)
 
 	// If there is only one generation and no tombstones, then there's nothing to
 	// do.
@@ -149,7 +193,16 @@ func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 	for i := 0; i < len(generations); i++ {
 		cur := generations[i]
 
-		if len(currentGen) == 0 || currentGen[0].level() == cur.level() {
+		// See if this generation is orphan'd which would prevent it from being further
+		// compacted until a final full compactin runs.
+		if i < len(generations)-1 {
+			if cur.level() < generations[i+1].level() {
+				currentGen = append(currentGen, cur)
+				continue
+			}
+		}
+
+		if len(currentGen) == 0 || currentGen.level() == cur.level() {
 			currentGen = append(currentGen, cur)
 			continue
 		}
@@ -166,7 +219,7 @@ func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 	// Remove any groups in the wrong level
 	var levelGroups []tsmGenerations
 	for _, cur := range groups {
-		if cur[0].level() == level {
+		if cur.level() == level {
 			levelGroups = append(levelGroups, cur)
 		}
 	}
@@ -183,9 +236,16 @@ func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 		minGenerations = level + 1
 	}
 
+	// Each compaction group should run against 4 generations.  For level 1, since these
+	// can get created much more quickly, bump the grouping to 8 to keep file counts lower.
+	groupSize := 4
+	if level == 1 {
+		groupSize = 8
+	}
+
 	var cGroups []CompactionGroup
 	for _, group := range levelGroups {
-		for _, chunk := range group.chunk(4) {
+		for _, chunk := range group.chunk(groupSize) {
 			var cGroup CompactionGroup
 			var hasTombstones bool
 			for _, gen := range chunk {
@@ -205,6 +265,10 @@ func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 		}
 	}
 
+	if !c.acquire(cGroups) {
+		return nil
+	}
+
 	return cGroups
 }
 
@@ -215,7 +279,7 @@ func (c *DefaultPlanner) PlanOptimize() []CompactionGroup {
 	// Determine the generations from all files on disk.  We need to treat
 	// a generation conceptually as a single file even though it may be
 	// split across several files in sequence.
-	generations := c.findGenerations()
+	generations := c.findGenerations(true)
 
 	// If there is only one generation and no tombstones, then there's nothing to
 	// do.
@@ -230,7 +294,16 @@ func (c *DefaultPlanner) PlanOptimize() []CompactionGroup {
 	for i := 0; i < len(generations); i++ {
 		cur := generations[i]
 
-		if len(currentGen) == 0 || currentGen[0].level() == cur.level() {
+		// See if this generation is orphan'd which would prevent it from being further
+		// compacted until a final full compactin runs.
+		if i < len(generations)-1 {
+			if cur.level() < generations[i+1].level() {
+				currentGen = append(currentGen, cur)
+				continue
+			}
+		}
+
+		if len(currentGen) == 0 || currentGen.level() == cur.level() {
 			currentGen = append(currentGen, cur)
 			continue
 		}
@@ -248,7 +321,7 @@ func (c *DefaultPlanner) PlanOptimize() []CompactionGroup {
 	// with the level planners
 	var levelGroups []tsmGenerations
 	for _, cur := range groups {
-		if cur[0].level() == 4 {
+		if cur.level() == 4 {
 			levelGroups = append(levelGroups, cur)
 		}
 	}
@@ -270,16 +343,20 @@ func (c *DefaultPlanner) PlanOptimize() []CompactionGroup {
 		cGroups = append(cGroups, cGroup)
 	}
 
+	if !c.acquire(cGroups) {
+		return nil
+	}
+
 	return cGroups
 }
 
 // Plan returns a set of TSM files to rewrite for level 4 or higher.  The planning returns
 // multiple groups if possible to allow compactions to run concurrently.
 func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
-	generations := c.findGenerations()
+	generations := c.findGenerations(true)
 
 	// first check if we should be doing a full compaction because nothing has been written in a long time
-	if c.CompactFullWriteColdDuration > 0 && time.Since(lastWrite) > c.CompactFullWriteColdDuration && len(generations) > 1 {
+	if c.compactFullWriteColdDuration > 0 && time.Since(lastWrite) > c.compactFullWriteColdDuration && len(generations) > 1 {
 		var tsmFiles []string
 		var genCount int
 		for i, group := range generations {
@@ -316,7 +393,11 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 			return nil
 		}
 
-		return []CompactionGroup{tsmFiles}
+		group := []CompactionGroup{tsmFiles}
+		if !c.acquire(group) {
+			return nil
+		}
+		return group
 	}
 
 	// don't plan if nothing has changed in the filestore
@@ -358,7 +439,7 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 		// Skip the file if it's over the max size and contains a full block or the generation is split
 		// over multiple files.  In the latter case, that would mean the data in the file spilled over
 		// the 2GB limit.
-		if g.size() > uint64(maxTSMFileSize) && c.FileStore.BlockCount(g.files[0].Path, 1) == tsdb.DefaultMaxPointsPerBlock || g.count() > 1 {
+		if g.size() > uint64(maxTSMFileSize) && c.FileStore.BlockCount(g.files[0].Path, 1) == tsdb.DefaultMaxPointsPerBlock {
 			start = i + 1
 		}
 
@@ -449,16 +530,22 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 		tsmFiles = append(tsmFiles, cGroup)
 	}
 
+	if !c.acquire(tsmFiles) {
+		return nil
+	}
 	return tsmFiles
 }
 
 // findGenerations groups all the TSM files by generation based
 // on their filename, then returns the generations in descending order (newest first).
-func (c *DefaultPlanner) findGenerations() tsmGenerations {
-	c.mu.RLock()
+// If skipInUse is true, tsm files that are part of an existing compaction plan
+// are not returned.
+func (c *DefaultPlanner) findGenerations(skipInUse bool) tsmGenerations {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	last := c.lastFindGenerations
 	lastGen := c.lastGenerations
-	c.mu.RUnlock()
 
 	if !last.IsZero() && c.FileStore.LastModified().Equal(last) {
 		return lastGen
@@ -469,6 +556,11 @@ func (c *DefaultPlanner) findGenerations() tsmGenerations {
 	generations := make(map[int]*tsmGeneration, len(tsmStats))
 	for _, f := range tsmStats {
 		gen, _, _ := ParseTSMFileName(f.Path)
+
+		// Skip any files that are assigned to a current compaction plan
+		if _, ok := c.filesInUse[f.Path]; skipInUse && ok {
+			continue
+		}
 
 		group := generations[gen]
 		if group == nil {
@@ -488,12 +580,44 @@ func (c *DefaultPlanner) findGenerations() tsmGenerations {
 		sort.Sort(orderedGenerations)
 	}
 
-	c.mu.Lock()
 	c.lastFindGenerations = genTime
 	c.lastGenerations = orderedGenerations
-	c.mu.Unlock()
 
 	return orderedGenerations
+}
+
+func (c *DefaultPlanner) acquire(groups []CompactionGroup) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// See if the new files are already in use
+	for _, g := range groups {
+		for _, f := range g {
+			if _, ok := c.filesInUse[f]; ok {
+				return false
+			}
+		}
+	}
+
+	// Mark all the new files in use
+	for _, g := range groups {
+		for _, f := range g {
+			c.filesInUse[f] = struct{}{}
+		}
+	}
+	return true
+}
+
+// Release removes the files reference in each compaction group allowing new plans
+// to be able to use them.
+func (c *DefaultPlanner) Release(groups []CompactionGroup) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, g := range groups {
+		for _, f := range g {
+			delete(c.filesInUse, f)
+		}
+	}
 }
 
 // Compactor merges multiple TSM files into new files or
@@ -504,11 +628,17 @@ type Compactor struct {
 
 	FileStore interface {
 		NextGeneration() int
+		TSMReader(path string) *TSMReader
 	}
 
 	mu                 sync.RWMutex
 	snapshotsEnabled   bool
 	compactionsEnabled bool
+
+	// The channel to signal that any in progress snapshots should be aborted.
+	snapshotsInterrupt chan struct{}
+	// The channel to signal that any in progress level compactions should be aborted.
+	compactionsInterrupt chan struct{}
 
 	files map[string]struct{}
 }
@@ -523,6 +653,9 @@ func (c *Compactor) Open() {
 
 	c.snapshotsEnabled = true
 	c.compactionsEnabled = true
+	c.snapshotsInterrupt = make(chan struct{})
+	c.compactionsInterrupt = make(chan struct{})
+
 	c.files = make(map[string]struct{})
 }
 
@@ -535,12 +668,22 @@ func (c *Compactor) Close() {
 	}
 	c.snapshotsEnabled = false
 	c.compactionsEnabled = false
+	if c.compactionsInterrupt != nil {
+		close(c.compactionsInterrupt)
+	}
+	if c.snapshotsInterrupt != nil {
+		close(c.snapshotsInterrupt)
+	}
 }
 
 // DisableSnapshots disables the compactor from performing snapshots.
 func (c *Compactor) DisableSnapshots() {
 	c.mu.Lock()
 	c.snapshotsEnabled = false
+	if c.snapshotsInterrupt != nil {
+		close(c.snapshotsInterrupt)
+		c.snapshotsInterrupt = nil
+	}
 	c.mu.Unlock()
 }
 
@@ -548,6 +691,9 @@ func (c *Compactor) DisableSnapshots() {
 func (c *Compactor) EnableSnapshots() {
 	c.mu.Lock()
 	c.snapshotsEnabled = true
+	if c.snapshotsInterrupt == nil {
+		c.snapshotsInterrupt = make(chan struct{})
+	}
 	c.mu.Unlock()
 }
 
@@ -555,6 +701,10 @@ func (c *Compactor) EnableSnapshots() {
 func (c *Compactor) DisableCompactions() {
 	c.mu.Lock()
 	c.compactionsEnabled = false
+	if c.compactionsInterrupt != nil {
+		close(c.compactionsInterrupt)
+		c.compactionsInterrupt = nil
+	}
 	c.mu.Unlock()
 }
 
@@ -562,6 +712,9 @@ func (c *Compactor) DisableCompactions() {
 func (c *Compactor) EnableCompactions() {
 	c.mu.Lock()
 	c.compactionsEnabled = true
+	if c.compactionsInterrupt == nil {
+		c.compactionsInterrupt = make(chan struct{})
+	}
 	c.mu.Unlock()
 }
 
@@ -569,14 +722,60 @@ func (c *Compactor) EnableCompactions() {
 func (c *Compactor) WriteSnapshot(cache *Cache) ([]string, error) {
 	c.mu.RLock()
 	enabled := c.snapshotsEnabled
+	intC := c.snapshotsInterrupt
 	c.mu.RUnlock()
 
 	if !enabled {
 		return nil, errSnapshotsDisabled
 	}
 
-	iter := NewCacheKeyIterator(cache, tsdb.DefaultMaxPointsPerBlock)
-	files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, iter)
+	card := cache.Count()
+
+	concurrency, maxConcurrency := 1, runtime.GOMAXPROCS(0)/2
+	if maxConcurrency < 1 {
+		maxConcurrency = 1
+	}
+	if maxConcurrency > 4 {
+		maxConcurrency = 4
+	}
+
+	concurrency = 1
+	if card >= 3*1024*1024 {
+		concurrency = 4
+	} else if card >= 1024*1024 {
+		concurrency = 2
+	}
+
+	if concurrency > maxConcurrency {
+		concurrency = maxConcurrency
+	}
+
+	splits := cache.Split(concurrency)
+
+	type res struct {
+		files []string
+		err   error
+	}
+
+	resC := make(chan res, concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(sp *Cache) {
+			iter := NewCacheKeyIterator(sp, tsdb.DefaultMaxPointsPerBlock, intC)
+			files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, iter)
+			resC <- res{files: files, err: err}
+
+		}(splits[i])
+	}
+
+	var err error
+	files := make([]string, 0, concurrency)
+	for i := 0; i < concurrency; i++ {
+		result := <-resC
+		if result.err != nil {
+			err = result.err
+		}
+		files = append(files, result.files...)
+	}
 
 	// See if we were disabled while writing a snapshot
 	c.mu.RLock()
@@ -596,6 +795,11 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 	if size <= 0 {
 		size = tsdb.DefaultMaxPointsPerBlock
 	}
+
+	c.mu.RLock()
+	intC := c.compactionsInterrupt
+	c.mu.RUnlock()
+
 	// The new compacted files need to added to the max generation in the
 	// set.  We need to find that max generation as well as the max sequence
 	// number to ensure we write to the next unique location.
@@ -619,16 +823,19 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 	// For each TSM file, create a TSM reader
 	var trs []*TSMReader
 	for _, file := range tsmFiles {
-		f, err := os.Open(file)
-		if err != nil {
-			return nil, err
+		select {
+		case <-intC:
+			return nil, errCompactionAborted{}
+		default:
 		}
 
-		tr, err := NewTSMReader(f)
-		if err != nil {
-			return nil, err
+		tr := c.FileStore.TSMReader(file)
+		if tr == nil {
+			// This would be a bug if this occurred as tsmFiles passed in should only be
+			// assigned to one compaction at any one time.  A nil tr would mean the file
+			// doesn't exist.
+			return nil, errCompactionAborted{fmt.Errorf("bad plan: %s", file)}
 		}
-		defer tr.Close()
 		trs = append(trs, tr)
 	}
 
@@ -636,7 +843,7 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 		return nil, nil
 	}
 
-	tsm, err := NewTSMKeyIterator(size, fast, trs...)
+	tsm, err := NewTSMKeyIterator(size, fast, intC, trs...)
 	if err != nil {
 		return nil, err
 	}
@@ -655,7 +862,7 @@ func (c *Compactor) CompactFull(tsmFiles []string) ([]string, error) {
 	}
 
 	if !c.add(tsmFiles) {
-		return nil, errCompactionInProgress
+		return nil, errCompactionInProgress{}
 	}
 	defer c.remove(tsmFiles)
 
@@ -667,6 +874,9 @@ func (c *Compactor) CompactFull(tsmFiles []string) ([]string, error) {
 	c.mu.RUnlock()
 
 	if !enabled {
+		if err := c.removeTmpFiles(files); err != nil {
+			return nil, err
+		}
 		return nil, errCompactionsDisabled
 	}
 
@@ -684,7 +894,7 @@ func (c *Compactor) CompactFast(tsmFiles []string) ([]string, error) {
 	}
 
 	if !c.add(tsmFiles) {
-		return nil, errCompactionInProgress
+		return nil, errCompactionInProgress{}
 	}
 	defer c.remove(tsmFiles)
 
@@ -696,11 +906,25 @@ func (c *Compactor) CompactFast(tsmFiles []string) ([]string, error) {
 	c.mu.RUnlock()
 
 	if !enabled {
+		if err := c.removeTmpFiles(files); err != nil {
+			return nil, err
+		}
 		return nil, errCompactionsDisabled
 	}
 
 	return files, err
 
+}
+
+// removeTmpFiles is responsible for cleaning up a compaction that
+// was started, but then abandoned before the temporary files were dealt with.
+func (c *Compactor) removeTmpFiles(files []string) error {
+	for _, f := range files {
+		if err := os.Remove(f); err != nil {
+			return fmt.Errorf("error removing temp compaction file: %v", err)
+		}
+	}
+	return nil
 }
 
 // writeNewFiles writes from the iterator into new TSM files, rotating
@@ -729,10 +953,21 @@ func (c *Compactor) writeNewFiles(generation, sequence int, iter KeyIterator) ([
 				return nil, err
 			}
 			break
-		}
-
-		// We hit an error but didn't finish the compaction.  Remove the temp file and abort.
-		if err != nil {
+		} else if _, ok := err.(errCompactionInProgress); ok {
+			// Don't clean up the file as another compaction is using it.  This should not happen as the
+			// planner keeps track of which files are assigned to compaction plans now.
+			return nil, err
+		} else if err != nil {
+			// Remove any tmp files we already completed
+			for _, f := range files {
+				if err := os.RemoveAll(f); err != nil {
+					return nil, err
+				}
+			}
+			// We hit an error and didn't finish the compaction.  Remove the temp file and abort.
+			if err := os.RemoveAll(fileName); err != nil {
+				return nil, err
+			}
 			return nil, err
 		}
 
@@ -744,9 +979,9 @@ func (c *Compactor) writeNewFiles(generation, sequence int, iter KeyIterator) ([
 }
 
 func (c *Compactor) write(path string, iter KeyIterator) (err error) {
-	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL, 0666)
+	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL|os.O_SYNC, 0666)
 	if err != nil {
-		return errCompactionInProgress
+		return errCompactionInProgress{err: err}
 	}
 
 	// Create the write for the new TSM file.
@@ -759,6 +994,18 @@ func (c *Compactor) write(path string, iter KeyIterator) (err error) {
 		if err == nil {
 			err = closeErr
 		}
+
+		// Check for errors where we should not remove the file
+		_, inProgress := err.(errCompactionInProgress)
+		maxBlocks := err == ErrMaxBlocksExceeded
+		maxFileSize := err == errMaxFileExceeded
+		if inProgress || maxBlocks || maxFileSize {
+			return
+		}
+
+		if err != nil {
+			w.Remove()
+		}
 	}()
 
 	for iter.Next() {
@@ -767,7 +1014,7 @@ func (c *Compactor) write(path string, iter KeyIterator) (err error) {
 		c.mu.RUnlock()
 
 		if !enabled {
-			return errCompactionAborted
+			return errCompactionAborted{}
 		}
 		// Each call to read returns the next sorted key (or the prior one if there are
 		// more values to write).  The size of values will be less than or equal to our
@@ -796,6 +1043,11 @@ func (c *Compactor) write(path string, iter KeyIterator) (err error) {
 
 			return errMaxFileExceeded
 		}
+	}
+
+	// Were there any errors encountered during iteration?
+	if err := iter.Err(); err != nil {
+		return err
 	}
 
 	// We're all done.  Close out the file.
@@ -838,10 +1090,13 @@ type KeyIterator interface {
 
 	// Read returns the key, time range, and raw data for the next block,
 	// or any error that occurred.
-	Read() (key string, minTime int64, maxTime int64, data []byte, err error)
+	Read() (key []byte, minTime int64, maxTime int64, data []byte, err error)
 
 	// Close closes the iterator.
 	Close() error
+
+	// Err returns any errors encountered during iteration.
+	Err() error
 }
 
 // tsmKeyIterator implements the KeyIterator for set of TSMReaders.  Iteration produces
@@ -874,7 +1129,8 @@ type tsmKeyIterator struct {
 
 	// key is the current key lowest key across all readers that has not be fully exhausted
 	// of values.
-	key string
+	key []byte
+	typ byte
 
 	iterators []*BlockIterator
 	blocks    blocks
@@ -882,16 +1138,22 @@ type tsmKeyIterator struct {
 	buf []blocks
 
 	// mergeValues are decoded blocks that have been combined
-	mergedValues Values
+	mergedFloatValues    FloatValues
+	mergedIntegerValues  IntegerValues
+	mergedUnsignedValues UnsignedValues
+	mergedBooleanValues  BooleanValues
+	mergedStringValues   StringValues
 
 	// merged are encoded blocks that have been combined or used as is
 	// without decode
-	merged blocks
+	merged    blocks
+	interrupt chan struct{}
 }
 
 type block struct {
-	key              string
+	key              []byte
 	minTime, maxTime int64
+	typ              byte
 	b                []byte
 	tombstones       []TimeRange
 
@@ -918,22 +1180,31 @@ func (b *block) markRead(min, max int64) {
 	}
 }
 
+func (b *block) partiallyRead() bool {
+	// If readMin and readMax are still the initial values, nothing has been read.
+	if b.readMin == int64(math.MaxInt64) && b.readMax == int64(math.MinInt64) {
+		return false
+	}
+	return b.readMin != b.minTime || b.readMax != b.maxTime
+}
+
 type blocks []*block
 
 func (a blocks) Len() int { return len(a) }
 
 func (a blocks) Less(i, j int) bool {
-	if a[i].key == a[j].key {
+	cmp := bytes.Compare(a[i].key, a[j].key)
+	if cmp == 0 {
 		return a[i].minTime < a[j].minTime
 	}
-	return a[i].key < a[j].key
+	return cmp < 0
 }
 
 func (a blocks) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
 // NewTSMKeyIterator returns a new TSM key iterator from readers.
 // size indicates the maximum number of values to encode in a single block.
-func NewTSMKeyIterator(size int, fast bool, readers ...*TSMReader) (KeyIterator, error) {
+func NewTSMKeyIterator(size int, fast bool, interrupt chan struct{}, readers ...*TSMReader) (KeyIterator, error) {
 	var iter []*BlockIterator
 	for _, r := range readers {
 		iter = append(iter, r.BlockIterator())
@@ -947,7 +1218,16 @@ func NewTSMKeyIterator(size int, fast bool, readers ...*TSMReader) (KeyIterator,
 		iterators: iter,
 		fast:      fast,
 		buf:       make([]blocks, len(iter)),
+		interrupt: interrupt,
 	}, nil
+}
+
+func (k *tsmKeyIterator) hasMergedValues() bool {
+	return len(k.mergedFloatValues) > 0 ||
+		len(k.mergedIntegerValues) > 0 ||
+		len(k.mergedUnsignedValues) > 0 ||
+		len(k.mergedStringValues) > 0 ||
+		len(k.mergedBooleanValues) > 0
 }
 
 // Next returns true if there are any values remaining in the iterator.
@@ -961,9 +1241,9 @@ func (k *tsmKeyIterator) Next() bool {
 	}
 
 	// Any merged values pending?
-	if len(k.mergedValues) > 0 {
+	if k.hasMergedValues() {
 		k.merge()
-		if len(k.merged) > 0 || len(k.mergedValues) > 0 {
+		if len(k.merged) > 0 || k.hasMergedValues() {
 			return true
 		}
 	}
@@ -971,17 +1251,17 @@ func (k *tsmKeyIterator) Next() bool {
 	// If we still have blocks from the last read, merge them
 	if len(k.blocks) > 0 {
 		k.merge()
-		if len(k.merged) > 0 || len(k.mergedValues) > 0 {
+		if len(k.merged) > 0 || k.hasMergedValues() {
 			return true
 		}
 	}
 
 	// Read the next block from each TSM iterator
 	for i, v := range k.buf {
-		if v == nil {
+		if len(v) == 0 {
 			iter := k.iterators[i]
 			if iter.Next() {
-				key, minTime, maxTime, _, b, err := iter.Read()
+				key, minTime, maxTime, typ, _, b, err := iter.Read()
 				if err != nil {
 					k.err = err
 				}
@@ -989,53 +1269,84 @@ func (k *tsmKeyIterator) Next() bool {
 				// This block may have ranges of time removed from it that would
 				// reduce the block min and max time.
 				tombstones := iter.r.TombstoneRange(key)
-				k.buf[i] = append(k.buf[i], &block{
-					minTime:    minTime,
-					maxTime:    maxTime,
-					key:        key,
-					b:          b,
-					tombstones: tombstones,
-					readMin:    math.MaxInt64,
-					readMax:    math.MinInt64,
-				})
+
+				var blk *block
+				if cap(k.buf[i]) > len(k.buf[i]) {
+					k.buf[i] = k.buf[i][:len(k.buf[i])+1]
+					blk = k.buf[i][len(k.buf[i])-1]
+					if blk == nil {
+						blk = &block{}
+						k.buf[i][len(k.buf[i])-1] = blk
+					}
+				} else {
+					blk = &block{}
+					k.buf[i] = append(k.buf[i], blk)
+				}
+				blk.minTime = minTime
+				blk.maxTime = maxTime
+				blk.key = key
+				blk.typ = typ
+				blk.b = b
+				blk.tombstones = tombstones
+				blk.readMin = math.MaxInt64
+				blk.readMax = math.MinInt64
 
 				blockKey := key
-				for iter.PeekNext() == blockKey {
+				for bytes.Equal(iter.PeekNext(), blockKey) {
 					iter.Next()
-					key, minTime, maxTime, _, b, err := iter.Read()
+					key, minTime, maxTime, typ, _, b, err := iter.Read()
 					if err != nil {
 						k.err = err
 					}
 
 					tombstones := iter.r.TombstoneRange(key)
 
-					k.buf[i] = append(k.buf[i], &block{
-						minTime:    minTime,
-						maxTime:    maxTime,
-						key:        key,
-						b:          b,
-						tombstones: tombstones,
-						readMin:    math.MaxInt64,
-						readMax:    math.MinInt64,
-					})
+					var blk *block
+					if cap(k.buf[i]) > len(k.buf[i]) {
+						k.buf[i] = k.buf[i][:len(k.buf[i])+1]
+						blk = k.buf[i][len(k.buf[i])-1]
+						if blk == nil {
+							blk = &block{}
+							k.buf[i][len(k.buf[i])-1] = blk
+						}
+					} else {
+						blk = &block{}
+						k.buf[i] = append(k.buf[i], blk)
+					}
+
+					blk.minTime = minTime
+					blk.maxTime = maxTime
+					blk.key = key
+					blk.typ = typ
+					blk.b = b
+					blk.tombstones = tombstones
+					blk.readMin = math.MaxInt64
+					blk.readMax = math.MinInt64
 				}
+			}
+
+			if iter.Err() != nil {
+				k.err = iter.Err()
 			}
 		}
 	}
 
 	// Each reader could have a different key that it's currently at, need to find
 	// the next smallest one to keep the sort ordering.
-	var minKey string
+	var minKey []byte
+	var minType byte
 	for _, b := range k.buf {
 		// block could be nil if the iterator has been exhausted for that file
 		if len(b) == 0 {
 			continue
 		}
-		if minKey == "" || b[0].key < minKey {
+		if len(minKey) == 0 || bytes.Compare(b[0].key, minKey) < 0 {
 			minKey = b[0].key
+			minType = b[0].typ
 		}
 	}
 	k.key = minKey
+	k.typ = minType
 
 	// Now we need to find all blocks that match the min key so we can combine and dedupe
 	// the blocks if necessary
@@ -1043,9 +1354,9 @@ func (k *tsmKeyIterator) Next() bool {
 		if len(b) == 0 {
 			continue
 		}
-		if b[0].key == k.key {
+		if bytes.Equal(b[0].key, k.key) {
 			k.blocks = append(k.blocks, b...)
-			k.buf[i] = nil
+			k.buf[i] = k.buf[i][:0]
 		}
 	}
 
@@ -1060,208 +1371,32 @@ func (k *tsmKeyIterator) Next() bool {
 
 // merge combines the next set of blocks into merged blocks.
 func (k *tsmKeyIterator) merge() {
-	// No blocks left, or pending merged values, we're done
-	if len(k.blocks) == 0 && len(k.merged) == 0 && len(k.mergedValues) == 0 {
-		return
-	}
-
-	dedup := false
-	if len(k.blocks) > 0 {
-		// If we have more than one block or any partially tombstoned blocks, we many need to dedup
-		dedup = len(k.blocks[0].tombstones) > 0
-
-		if len(k.blocks) > 1 {
-			// Quickly scan each block to see if any overlap with the prior block, if they overlap then
-			// we need to dedup as there may be duplicate points now
-			for i := 1; !dedup && i < len(k.blocks); i++ {
-				if k.blocks[i].read() {
-					dedup = true
-					break
-				}
-				if k.blocks[i].minTime <= k.blocks[i-1].maxTime || len(k.blocks[i].tombstones) > 0 {
-					dedup = true
-					break
-				}
-			}
-		}
-	}
-
-	k.merged = k.combine(dedup)
-}
-
-// combine returns a new set of blocks using the current blocks in the buffers.  If dedup
-// is true, all the blocks will be decoded, dedup and sorted in in order.  If dedup is false,
-// only blocks that are smaller than the chunk size will be decoded and combined.
-func (k *tsmKeyIterator) combine(dedup bool) blocks {
-	if dedup {
-		for len(k.mergedValues) < k.size && len(k.blocks) > 0 {
-			for len(k.blocks) > 0 && k.blocks[0].read() {
-				k.blocks = k.blocks[1:]
-			}
-
-			if len(k.blocks) == 0 {
-				break
-			}
-			first := k.blocks[0]
-
-			// We have some overlapping blocks so decode all, append in order and then dedup
-			for i := 0; i < len(k.blocks); i++ {
-				if !k.blocks[i].overlapsTimeRange(first.minTime, first.maxTime) || k.blocks[i].read() {
-					continue
-				}
-
-				v, err := DecodeBlock(k.blocks[i].b, nil)
-				if err != nil {
-					k.err = err
-					return nil
-				}
-
-				// Remove values we already read
-				v = Values(v).Exclude(k.blocks[i].readMin, k.blocks[i].readMax)
-
-				// Filter out only the values for overlapping block
-				v = Values(v).Include(first.minTime, first.maxTime)
-				if len(v) > 0 {
-					// Record that we read a subset of the block
-					k.blocks[i].markRead(v[0].UnixNano(), v[len(v)-1].UnixNano())
-				}
-
-				// Apply each tombstone to the block
-				for _, ts := range k.blocks[i].tombstones {
-					v = Values(v).Exclude(ts.Min, ts.Max)
-				}
-
-				k.mergedValues = k.mergedValues.Merge(v)
-
-				// Allow other goroutines to run
-				runtime.Gosched()
-
-			}
-			k.blocks = k.blocks[1:]
-		}
-
-		// Since we combined multiple blocks, we could have more values than we should put into
-		// a single block.  We need to chunk them up into groups and re-encode them.
-		return k.chunk(nil)
-	} else {
-		var chunked blocks
-		var i int
-
-		for i < len(k.blocks) {
-
-			// skip this block if it's values were already read
-			if k.blocks[i].read() {
-				i++
-				continue
-			}
-			// If we this block is already full, just add it as is
-			if BlockCount(k.blocks[i].b) >= k.size {
-				chunked = append(chunked, k.blocks[i])
-			} else {
-				break
-			}
-			i++
-			// Allow other goroutines to run
-			runtime.Gosched()
-		}
-
-		if k.fast {
-			for i < len(k.blocks) {
-				// skip this block if it's values were already read
-				if k.blocks[i].read() {
-					i++
-					continue
-				}
-
-				chunked = append(chunked, k.blocks[i])
-				i++
-				// Allow other goroutines to run
-				runtime.Gosched()
-			}
-		}
-
-		// If we only have 1 blocks left, just append it as is and avoid decoding/recoding
-		if i == len(k.blocks)-1 {
-			if !k.blocks[i].read() {
-				chunked = append(chunked, k.blocks[i])
-			}
-			i++
-		}
-
-		// The remaining blocks can be combined and we know that they do not overlap and
-		// so we can just append each, sort and re-encode.
-		for i < len(k.blocks) && len(k.mergedValues) < k.size {
-			if k.blocks[i].read() {
-				i++
-				continue
-			}
-
-			v, err := DecodeBlock(k.blocks[i].b, nil)
-			if err != nil {
-				k.err = err
-				return nil
-			}
-
-			// Apply each tombstone to the block
-			for _, ts := range k.blocks[i].tombstones {
-				v = Values(v).Exclude(ts.Min, ts.Max)
-			}
-
-			k.blocks[i].markRead(k.blocks[i].minTime, k.blocks[i].maxTime)
-
-			k.mergedValues = k.mergedValues.Merge(v)
-			i++
-			// Allow other goroutines to run
-			runtime.Gosched()
-		}
-
-		k.blocks = k.blocks[i:]
-
-		return k.chunk(chunked)
+	switch k.typ {
+	case BlockFloat64:
+		k.mergeFloat()
+	case BlockInteger:
+		k.mergeInteger()
+	case BlockUnsigned:
+		k.mergeUnsigned()
+	case BlockBoolean:
+		k.mergeBoolean()
+	case BlockString:
+		k.mergeString()
+	default:
+		k.err = fmt.Errorf("unknown block type: %v", k.typ)
 	}
 }
 
-func (k *tsmKeyIterator) chunk(dst blocks) blocks {
-	if len(k.mergedValues) > k.size {
-		values := k.mergedValues[:k.size]
-		cb, err := Values(values).Encode(nil)
-		if err != nil {
-			k.err = err
-			return nil
-		}
-
-		dst = append(dst, &block{
-			minTime: values[0].UnixNano(),
-			maxTime: values[len(values)-1].UnixNano(),
-			key:     k.key,
-			b:       cb,
-		})
-		k.mergedValues = k.mergedValues[k.size:]
-		return dst
+func (k *tsmKeyIterator) Read() ([]byte, int64, int64, []byte, error) {
+	// See if compactions were disabled while we were running.
+	select {
+	case <-k.interrupt:
+		return nil, 0, 0, nil, errCompactionAborted{}
+	default:
 	}
 
-	// Re-encode the remaining values into the last block
-	if len(k.mergedValues) > 0 {
-		cb, err := Values(k.mergedValues).Encode(nil)
-		if err != nil {
-			k.err = err
-			return nil
-		}
-
-		dst = append(dst, &block{
-			minTime: k.mergedValues[0].UnixNano(),
-			maxTime: k.mergedValues[len(k.mergedValues)-1].UnixNano(),
-			key:     k.key,
-			b:       cb,
-		})
-		k.mergedValues = k.mergedValues[:0]
-	}
-	return dst
-}
-
-func (k *tsmKeyIterator) Read() (string, int64, int64, []byte, error) {
 	if len(k.merged) == 0 {
-		return "", 0, 0, nil, k.err
+		return nil, 0, 0, nil, k.err
 	}
 
 	block := k.merged[0]
@@ -1280,25 +1415,32 @@ func (k *tsmKeyIterator) Close() error {
 	return nil
 }
 
+// Error returns any errors encountered during iteration.
+func (k *tsmKeyIterator) Err() error {
+	return k.err
+}
+
 type cacheKeyIterator struct {
 	cache *Cache
 	size  int
-	order []string
+	order [][]byte
 
-	i      int
-	blocks [][]cacheBlock
-	ready  []chan struct{}
+	i         int
+	blocks    [][]cacheBlock
+	ready     []chan struct{}
+	interrupt chan struct{}
+	err       error
 }
 
 type cacheBlock struct {
-	k                string
+	k                []byte
 	minTime, maxTime int64
 	b                []byte
 	err              error
 }
 
 // NewCacheKeyIterator returns a new KeyIterator from a Cache.
-func NewCacheKeyIterator(cache *Cache, size int) KeyIterator {
+func NewCacheKeyIterator(cache *Cache, size int, interrupt chan struct{}) KeyIterator {
 	keys := cache.Keys()
 
 	chans := make([]chan struct{}, len(keys))
@@ -1307,12 +1449,13 @@ func NewCacheKeyIterator(cache *Cache, size int) KeyIterator {
 	}
 
 	cki := &cacheKeyIterator{
-		i:      -1,
-		size:   size,
-		cache:  cache,
-		order:  keys,
-		ready:  chans,
-		blocks: make([][]cacheBlock, len(keys)),
+		i:         -1,
+		size:      size,
+		cache:     cache,
+		order:     keys,
+		ready:     chans,
+		blocks:    make([][]cacheBlock, len(keys)),
+		interrupt: interrupt,
 	}
 	go cki.encode()
 	return cki
@@ -1323,53 +1466,80 @@ func (c *cacheKeyIterator) encode() {
 	n := len(c.ready)
 
 	// Divide the keyset across each CPU
-	chunkSize := 128
+	chunkSize := 1
 	idx := uint64(0)
+
 	for i := 0; i < concurrency; i++ {
 		// Run one goroutine per CPU and encode a section of the key space concurrently
 		go func() {
+			tenc := getTimeEncoder(tsdb.DefaultMaxPointsPerBlock)
+			fenc := getFloatEncoder(tsdb.DefaultMaxPointsPerBlock)
+			benc := getBooleanEncoder(tsdb.DefaultMaxPointsPerBlock)
+			uenc := getUnsignedEncoder(tsdb.DefaultMaxPointsPerBlock)
+			senc := getStringEncoder(tsdb.DefaultMaxPointsPerBlock)
+			ienc := getIntegerEncoder(tsdb.DefaultMaxPointsPerBlock)
+
+			defer putTimeEncoder(tenc)
+			defer putFloatEncoder(fenc)
+			defer putBooleanEncoder(benc)
+			defer putUnsignedEncoder(uenc)
+			defer putStringEncoder(senc)
+			defer putIntegerEncoder(ienc)
+
 			for {
-				start := int(atomic.AddUint64(&idx, uint64(chunkSize))) - chunkSize
-				if start >= n {
+				i := int(atomic.AddUint64(&idx, uint64(chunkSize))) - chunkSize
+
+				if i >= n {
 					break
 				}
-				end := start + chunkSize
-				if end > n {
-					end = n
+
+				key := c.order[i]
+				values := c.cache.values(key)
+
+				for len(values) > 0 {
+
+					end := len(values)
+					if end > c.size {
+						end = c.size
+					}
+
+					minTime, maxTime := values[0].UnixNano(), values[end-1].UnixNano()
+					var b []byte
+					var err error
+
+					switch values[0].(type) {
+					case FloatValue:
+						b, err = encodeFloatBlockUsing(nil, values[:end], tenc, fenc)
+					case IntegerValue:
+						b, err = encodeIntegerBlockUsing(nil, values[:end], tenc, ienc)
+					case UnsignedValue:
+						b, err = encodeUnsignedBlockUsing(nil, values[:end], tenc, uenc)
+					case BooleanValue:
+						b, err = encodeBooleanBlockUsing(nil, values[:end], tenc, benc)
+					case StringValue:
+						b, err = encodeStringBlockUsing(nil, values[:end], tenc, senc)
+					default:
+						b, err = Values(values[:end]).Encode(nil)
+					}
+
+					values = values[end:]
+
+					c.blocks[i] = append(c.blocks[i], cacheBlock{
+						k:       key,
+						minTime: minTime,
+						maxTime: maxTime,
+						b:       b,
+						err:     err,
+					})
+
+					if err != nil {
+						c.err = err
+					}
 				}
-				c.encodeRange(start, end)
+				// Notify this key is fully encoded
+				c.ready[i] <- struct{}{}
 			}
 		}()
-	}
-}
-
-func (c *cacheKeyIterator) encodeRange(start, stop int) {
-	for i := start; i < stop; i++ {
-		key := c.order[i]
-		values := c.cache.values(key)
-
-		for len(values) > 0 {
-			minTime, maxTime := values[0].UnixNano(), values[len(values)-1].UnixNano()
-			var b []byte
-			var err error
-			if len(values) > c.size {
-				maxTime = values[c.size-1].UnixNano()
-				b, err = Values(values[:c.size]).Encode(nil)
-				values = values[c.size:]
-			} else {
-				b, err = Values(values).Encode(nil)
-				values = values[:0]
-			}
-			c.blocks[i] = append(c.blocks[i], cacheBlock{
-				k:       key,
-				minTime: minTime,
-				maxTime: maxTime,
-				b:       b,
-				err:     err,
-			})
-		}
-		// Notify this key is fully encoded
-		c.ready[i] <- struct{}{}
 	}
 }
 
@@ -1390,13 +1560,25 @@ func (c *cacheKeyIterator) Next() bool {
 	return true
 }
 
-func (c *cacheKeyIterator) Read() (string, int64, int64, []byte, error) {
+func (c *cacheKeyIterator) Read() ([]byte, int64, int64, []byte, error) {
+	// See if snapshot compactions were disabled while we were running.
+	select {
+	case <-c.interrupt:
+		c.err = errCompactionAborted{}
+		return nil, 0, 0, nil, c.err
+	default:
+	}
+
 	blk := c.blocks[c.i][0]
 	return blk.k, blk.minTime, blk.maxTime, blk.b, blk.err
 }
 
 func (c *cacheKeyIterator) Close() error {
 	return nil
+}
+
+func (c *cacheKeyIterator) Err() error {
+	return c.err
 }
 
 type tsmGenerations []*tsmGeneration
@@ -1411,6 +1593,17 @@ func (a tsmGenerations) hasTombstones() bool {
 		}
 	}
 	return false
+}
+
+func (a tsmGenerations) level() int {
+	var level int
+	for _, g := range a {
+		lev := g.level()
+		if lev > level {
+			level = lev
+		}
+	}
+	return level
 }
 
 func (a tsmGenerations) chunk(size int) []tsmGenerations {
