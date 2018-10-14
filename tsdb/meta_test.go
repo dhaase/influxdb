@@ -7,7 +7,6 @@ import (
 
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/tsdb"
-	"github.com/influxdata/influxdb/tsdb/index/inmem"
 )
 
 // Ensure tags can be marshaled into a byte slice.
@@ -142,18 +141,20 @@ func benchmarkMakeTagsKey(b *testing.B, keyN int) {
 
 type TestSeries struct {
 	Measurement string
-	Series      *inmem.Series
+	Key         string
+	Tags        models.Tags
 }
 
 func genTestSeries(mCnt, tCnt, vCnt int) []*TestSeries {
 	measurements := genStrList("measurement", mCnt)
 	tagSets := NewTagSetGenerator(tCnt, vCnt).AllSets()
-	series := []*TestSeries{}
+	series := make([]*TestSeries, 0, mCnt*len(tagSets))
 	for _, m := range measurements {
 		for _, ts := range tagSets {
 			series = append(series, &TestSeries{
 				Measurement: m,
-				Series:      inmem.NewSeries([]byte(fmt.Sprintf("%s:%s", m, string(tsdb.MarshalTags(ts)))), models.NewTags(ts)),
+				Key:         fmt.Sprintf("%s:%s", m, string(tsdb.MarshalTags(ts))),
+				Tags:        models.NewTags(ts),
 			})
 		}
 	}
@@ -167,7 +168,7 @@ type TagValGenerator struct {
 }
 
 func NewTagValGenerator(tagKey string, nVals int) *TagValGenerator {
-	tvg := &TagValGenerator{Key: tagKey}
+	tvg := &TagValGenerator{Key: tagKey, Vals: make([]string, 0, nVals)}
 	for i := 0; i < nVals; i++ {
 		tvg.Vals = append(tvg.Vals, fmt.Sprintf("tagValue%d", i))
 	}
@@ -199,7 +200,7 @@ type TagSetGenerator struct {
 }
 
 func NewTagSetGenerator(nSets int, nTagVals ...int) *TagSetGenerator {
-	tsg := &TagSetGenerator{}
+	tsg := &TagSetGenerator{TagVals: make([]*TagValGenerator, 0, nSets)}
 	for i := 0; i < nSets; i++ {
 		nVals := nTagVals[0]
 		if i < len(nTagVals) {

@@ -60,11 +60,15 @@ curl -G "http://localhost:8086/query?pretty=true" --data-urlencode "db=mydb" \
 
 * Read more about the [design goals and motivations of the project](https://docs.influxdata.com/influxdb/latest/).
 * Follow the [getting started guide](https://docs.influxdata.com/influxdb/latest/introduction/getting_started/) to learn the basics in just a few minutes.
-* Learn more about [InfluxDB's key concepts](https://docs.influxdata.com/influxdb/latest/guides/writing_data/).
+* Learn more about [InfluxDB's key concepts](https://docs.influxdata.com/influxdb/latest/concepts/key_concepts/).
 
 ## Contributing
 
 If you're feeling adventurous and want to contribute to InfluxDB, see our [contributing doc](https://github.com/influxdata/influxdb/blob/master/CONTRIBUTING.md) for info on how to make feature requests, build from source, and run tests.
+
+## Licensing
+
+See [LICENSE](./LICENSE) and [DEPENDENCIES](./DEPENDENCIES).
 
 ## Looking for Support?
 

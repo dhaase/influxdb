@@ -119,7 +119,7 @@ func TestPointsWriter_MapShards_AlterShardDuration(t *testing.T) {
 
 	// Point is beyond previous shard group so a new shard group should be
 	// created.
-	if shardMappings, err = c.MapShards(pr); err != nil {
+	if _, err = c.MapShards(pr); err != nil {
 		t.Fatalf("unexpected an error: %v", err)
 	}
 
@@ -523,7 +523,7 @@ func TestBufferedPointsWriter(t *testing.T) {
 	reset()
 
 	// Test writing points one at a time.
-	for i, _ := range r.Points {
+	for i := range r.Points {
 		if err := w.WritePointsInto(&coordinator.IntoWriteRequest{
 			Database:        db,
 			RetentionPolicy: rp,

@@ -9,7 +9,7 @@
 #      1: race enabled 64bit tests
 #      2: normal 32bit tests
 #      3: tsi build
-#      4: go 1.9
+#      4: go 1.11
 #      count: print the number of test environments
 #      *: to run all tests in parallel containers
 #
@@ -26,7 +26,7 @@ OUTPUT_DIR=${OUTPUT_DIR-./test-logs}
 # Set default parallelism
 PARALLELISM=${PARALLELISM-1}
 # Set default timeout
-TIMEOUT=${TIMEOUT-1200s}
+TIMEOUT=${TIMEOUT-1500s}
 
 # Default to deleteing the container
 DOCKER_RM=${DOCKER_RM-true}
@@ -90,7 +90,7 @@ function build_docker_image {
     local imagename=$2
 
     echo "Building docker image $imagename"
-    exit_if_fail docker build -f "$dockerfile" -t "$imagename" .
+    exit_if_fail docker build --rm=$DOCKER_RM -f "$dockerfile" -t "$imagename" .
 }
 
 
@@ -124,8 +124,8 @@ case $ENVIRONMENT_INDEX in
         rc=$?
         ;;
     4)
-        # go1.9
-        run_test_docker Dockerfile_build_ubuntu64_go19 test_64bit --test --junit-report
+        # go1.11
+        run_test_docker Dockerfile_build_ubuntu64_go1.11 test_64bit --test --junit-report
         rc=$?
         ;;
     "count")

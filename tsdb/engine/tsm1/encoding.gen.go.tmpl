@@ -3,12 +3,25 @@ package tsm1
 import (
 	"fmt"
 	"sort"
+
+	"github.com/influxdata/influxdb/tsdb"
 )
 
 {{range .}}
 
 // {{.Name}}Values represents a slice of {{.Name}} values.
 type {{.Name}}Values []{{.Name}}Value
+
+{{if ne .Name ""}}
+func New{{.Name}}ArrayFromValues(v {{.Name}}Values) *tsdb.{{.Name}}Array {
+	a := tsdb.New{{.Name}}ArrayLen(len(v))
+	for i, val := range v {
+		a.Timestamps[i] = val.unixnano
+		a.Values[i] = val.value
+	}
+	return a
+}
+{{end}}
 
 func (a {{.Name}}Values) MinTime() int64 {
 	return a[0].UnixNano()
@@ -51,7 +64,8 @@ func (a {{.Name}}Values) assertOrdered() {
 
 
 // Deduplicate returns a new slice with any values that have the same timestamp removed.
-// The Value that appears last in the slice is the one that is kept.
+// The Value that appears last in the slice is the one that is kept.  The returned
+// Values are sorted if necessary.
 func (a {{.Name}}Values) Deduplicate() {{.Name}}Values {
 	if len(a) <= 1 {
 		return a
@@ -83,7 +97,8 @@ func (a {{.Name}}Values) Deduplicate() {{.Name}}Values {
 	return a[:i+1]
 }
 
-//  Exclude returns the subset of values not in [min, max]
+// Exclude returns the subset of values not in [min, max].  The values must
+// be deduplicated and sorted before calling Exclude or the results are undefined.
 func (a {{.Name}}Values) Exclude(min, max int64) {{.Name}}Values {
 	rmin, rmax := a.FindRange(min, max)
 	if rmin == -1 && rmax == -1 {
@@ -108,7 +123,8 @@ func (a {{.Name}}Values) Exclude(min, max int64) {{.Name}}Values {
 	return a[:rmin]
 }
 
-// Include returns the subset values between min and max inclusive.
+// Include returns the subset values between min and max inclusive. The values must
+// be deduplicated and sorted before calling Exclude or the results are undefined.
 func (a {{.Name}}Values) Include(min, max int64) {{.Name}}Values {
 	rmin, rmax := a.FindRange(min, max)
 	if rmin == -1 && rmax == -1 {
@@ -157,9 +173,11 @@ func (a {{.Name}}Values) search(v int64) int {
 // FindRange returns the positions where min and max would be
 // inserted into the array. If a[0].UnixNano() > max or
 // a[len-1].UnixNano() < min then FindRange returns (-1, -1)
-// indicating the array is outside the [min, max].
+// indicating the array is outside the [min, max]. The values must
+// be deduplicated and sorted before calling Exclude or the results
+// are undefined.
 func (a {{.Name}}Values) FindRange(min, max int64) (int, int) {
-	if len(a) == 0 {
+	if len(a) == 0 || min > max {
 		return -1, -1
 	}
 
